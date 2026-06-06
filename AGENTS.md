@@ -21,13 +21,14 @@ Implemented areas:
 
 Target environment:
 
-- Windows
+- macOS
+- Shell: zsh
 - Conda environment: `cc`
 - Python 3.11+
 
 Typical setup:
 
-```powershell
+```bash
 conda activate cc
 pip install -e .
 ```
@@ -36,10 +37,10 @@ pip install -e .
 
 OpenAI-compatible settings:
 
-```powershell
-$env:OPENAI_API_KEY="your-key"
-$env:OPENAI_BASE_URL="https://api.openai.com/v1"
-$env:OPENAI_MODEL="gpt-4.1-mini"
+```bash
+export OPENAI_API_KEY="your-key"
+export OPENAI_BASE_URL="https://api.openai.com/v1"
+export OPENAI_MODEL="gpt-4.1-mini"
 ```
 
 CLI flags can override model and API base URL:
@@ -56,6 +57,7 @@ cca --model gpt-4.1-mini --api-base https://api.openai.com/v1 "hello"
 - Validate tool inputs before execution.
 - Truncate or persist large model/tool outputs before they bloat history.
 - Ask for permission before file writes or shell execution unless the selected permission mode explicitly allows it.
+- Treat sandboxing as a runtime safety layer for shell execution, separate from permission checks. On macOS, prefer `sandbox-exec` profiles when implementing sandboxed `run_shell` behavior.
 - Preserve `AGENTS.md` as the primary project instruction file; `CLAUDE.md` is also loaded for compatibility.
 
 ## Code Layout
@@ -79,7 +81,7 @@ src/mini_coding_agent/
 
 Before handing off a change, run:
 
-```powershell
+```bash
 conda run -n cc python -m compileall src
 conda run -n cc cca --help
 ```

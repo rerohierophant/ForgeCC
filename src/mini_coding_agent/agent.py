@@ -49,6 +49,7 @@ from .session import save_session
 from .prompt import build_system_prompt
 from .subagent import get_sub_agent_config
 from .mcp_client import McpManager
+from .hooks import run_hooks
 
 # ─── Retry with exponential backoff ──────────────────────────
 
@@ -291,6 +292,12 @@ class Agent:
     # ─── Main entry point ────────────────────────────────────
 
     async def chat(self, user_message: str) -> None:
+        prompt_hook = await self._run_user_prompt_submit_hook(user_message)
+        if prompt_hook["blocked"]:
+            print_error(prompt_hook["message"])
+            return
+        user_message = prompt_hook["prompt"]
+
         # MCP在第一次真正聊天时才懒加载 (只有main agent加载MCP，避免重复加载)
         if not self._mcp_initialized and not self.is_sub_agent:
             self._mcp_initialized = True
@@ -313,6 +320,32 @@ class Agent:
         if not self.is_sub_agent: # 仅在main agent中自动保存
             print_divider()
             self._auto_save()
+
+    def _hook_base_payload(self) -> dict:
+        return {
+            "session_id": self.session_id,
+            "cwd": str(Path.cwd()),
+            "permission_mode": self.permission_mode,
+            "model": self.model,
+            "is_sub_agent": self.is_sub_agent,
+        }
+
+    async def _run_user_prompt_submit_hook(self, prompt: str) -> dict:
+        hook = await run_hooks(
+            "UserPromptSubmit",
+            {**self._hook_base_payload(), "prompt": prompt},
+        )
+        if hook.denied:
+            return {
+                "blocked": True,
+                "message": hook.message or "User prompt blocked by UserPromptSubmit hook.",
+                "prompt": prompt,
+            }
+        if hook.updated_input and isinstance(hook.updated_input.get("prompt"), str):
+            prompt = hook.updated_input["prompt"]
+        if hook.additional_context:
+            prompt = prompt + "\n\n<user-prompt-submit-hook>\n" + hook.additional_context + "\n</user-prompt-submit-hook>"
+        return {"blocked": False, "message": "", "prompt": prompt}
 
     # ─── Sub-agent entry point ────────────────────────────────
 
@@ -522,6 +555,115 @@ class Agent:
         if self._mcp_manager.is_mcp_tool(name):
             return await self._mcp_manager.call_tool(name, inp)
         return await execute_tool(name, inp, self._read_file_state)
+
+    async def _run_pre_tool_use_hook(self, tool_name: str, inp: dict, tool_use_id: str) -> dict:
+        hook = await run_hooks(
+            "PreToolUse",
+            {
+                **self._hook_base_payload(),
+                "tool_name": tool_name,
+                "tool_input": inp,
+                "tool_use_id": tool_use_id,
+            },
+            matcher_value=tool_name,
+        )
+        if hook.updated_input:
+            inp = hook.updated_input
+        if hook.denied:
+            return {
+                "allowed": False,
+                "input": inp,
+                "result": f"Action denied by PreToolUse hook: {hook.message or 'blocked by hook'}",
+            }
+        return {"allowed": True, "input": inp, "result": ""}
+
+    async def _run_permission_request_hook(self, tool_name: str, inp: dict, tool_use_id: str, message: str) -> dict:
+        hook = await run_hooks(
+            "PermissionRequest",
+            {
+                **self._hook_base_payload(),
+                "tool_name": tool_name,
+                "tool_input": inp,
+                "tool_use_id": tool_use_id,
+                "message": message,
+            },
+            matcher_value=tool_name,
+        )
+        if hook.updated_input:
+            inp = hook.updated_input
+        if hook.allowed:
+            return {"decision": "allow", "input": inp, "message": hook.message}
+        if hook.denied:
+            return {
+                "decision": "deny",
+                "input": inp,
+                "message": hook.message or "Permission denied by PermissionRequest hook.",
+            }
+        return {"decision": "defer", "input": inp, "message": ""}
+
+    async def _run_post_tool_failure_hook(
+        self,
+        tool_name: str,
+        inp: dict,
+        tool_use_id: str,
+        error: str,
+    ) -> str:
+        hook = await run_hooks(
+            "PostToolUseFailure",
+            {
+                **self._hook_base_payload(),
+                "tool_name": tool_name,
+                "tool_input": inp,
+                "tool_use_id": tool_use_id,
+                "error": {"message": error},
+            },
+            matcher_value=tool_name,
+        )
+        if hook.additional_context:
+            return error + "\n\n<post-tool-use-failure-hook>\n" + hook.additional_context + "\n</post-tool-use-failure-hook>"
+        if hook.message:
+            return error + "\n\nPostToolUseFailure hook: " + hook.message
+        return error
+
+    async def _execute_tool_call_with_hooks(self, name: str, inp: dict, tool_use_id: str) -> str:
+        try:
+            raw = await self._execute_tool_call(name, inp)
+        except Exception as exc:
+            return await self._run_post_tool_failure_hook(name, inp, tool_use_id, str(exc))
+
+        if self._is_tool_failure(raw):
+            return await self._run_post_tool_failure_hook(name, inp, tool_use_id, raw)
+
+        hook = await run_hooks(
+            "PostToolUse",
+            {
+                **self._hook_base_payload(),
+                "tool_name": name,
+                "tool_input": inp,
+                "tool_use_id": tool_use_id,
+                "tool_response": raw,
+            },
+            matcher_value=name,
+        )
+        if hook.denied:
+            message = hook.message or "PostToolUse hook blocked the completed tool result."
+            return await self._run_post_tool_failure_hook(name, inp, tool_use_id, message)
+        if hook.additional_context:
+            raw = raw + "\n\n<post-tool-use-hook>\n" + hook.additional_context + "\n</post-tool-use-hook>"
+        return raw
+
+    def _is_tool_failure(self, result: str) -> bool:
+        if not isinstance(result, str):
+            return False
+        failure_prefixes = (
+            "Error:",
+            "Error ",
+            "Unknown tool:",
+            "Action denied:",
+            "User denied",
+            "Warning:",
+        )
+        return result.startswith(failure_prefixes)
 
     # ─── Skill fork mode ─────────────────────────────────────
 
@@ -795,18 +937,39 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     inp = json.loads(tc["function"]["arguments"]) # 尝试解析tool call参数
                 except Exception:
                     inp = {}
+                tool_use_id = tc.get("id", "")
 
+                pre = await self._run_pre_tool_use_hook(fn_name, inp, tool_use_id)
+                inp = pre["input"]
                 print_tool_call(fn_name, inp)
+                if not pre["allowed"]:
+                    result = await self._run_post_tool_failure_hook(fn_name, inp, tool_use_id, pre["result"])
+                    print_info(result)
+                    oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False, "result": result})
+                    continue
 
                 perm = check_permission(fn_name, inp, self.permission_mode, self._plan_file_path)
                 if perm["action"] == "deny":
+                    denied = f"Action denied: {perm.get('message', '')}"
+                    result = await self._run_post_tool_failure_hook(fn_name, inp, tool_use_id, denied)
                     print_info(f"Denied: {perm.get('message', '')}")
-                    oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False, "result": f"Action denied: {perm.get('message', '')}"}) # 把拒绝原因作为tool result返回
+                    oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False, "result": result}) # 把拒绝原因作为tool result返回
                     continue
                 if perm["action"] == "confirm" and perm.get("message") and perm["message"] not in self._confirmed_paths:
+                    hook_decision = await self._run_permission_request_hook(fn_name, inp, tool_use_id, perm["message"])
+                    inp = hook_decision["input"]
+                    if hook_decision["decision"] == "deny":
+                        result = await self._run_post_tool_failure_hook(fn_name, inp, tool_use_id, f"Action denied: {hook_decision['message']}")
+                        oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False, "result": result})
+                        continue
+                    if hook_decision["decision"] == "allow":
+                        self._confirmed_paths.add(perm["message"])
+                        oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": True})
+                        continue
                     confirmed = await self._confirm_dangerous(perm["message"]) # 需要用户确认危险操作
                     if not confirmed:
-                        oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False, "result": "User denied this action."})
+                        result = await self._run_post_tool_failure_hook(fn_name, inp, tool_use_id, "User denied this action.")
+                        oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False, "result": result})
                         continue
                     self._confirmed_paths.add(perm["message"])
                 oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": True})
@@ -827,7 +990,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
                 if batch["concurrent"]:
                     async def _run_oai_safe(ct_item: dict) -> tuple[dict, str]:
-                        raw = await self._execute_tool_call(ct_item["fn"], ct_item["inp"]) # 执行工具
+                        raw = await self._execute_tool_call_with_hooks(ct_item["fn"], ct_item["inp"], ct_item["tc"].get("id", "")) # 执行工具
                         res = self._persist_large_result(ct_item["fn"], raw) # 处理过大的工具结果
                         print_tool_result(ct_item["fn"], res) # 打印工具结果
                         return ct_item, res
@@ -840,7 +1003,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                         if not ct["allowed"]:
                             self._openai_messages.append({"role": "tool", "tool_call_id": ct["tc"]["id"], "content": ct["result"]})
                             continue
-                        raw = await self._execute_tool_call(ct["fn"], ct["inp"])
+                        raw = await self._execute_tool_call_with_hooks(ct["fn"], ct["inp"], ct["tc"].get("id", ""))
                         res = self._persist_large_result(ct["fn"], raw)
                         print_tool_result(ct["fn"], res)
 

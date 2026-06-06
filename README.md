@@ -15,6 +15,7 @@ ForgeCC 是一个基于 Python 的 coding agent 学习项目，参考 `claude-co
 - 记忆系统：按项目保存记忆并注入 prompt
 - Skills：从 `.claude/skills/<name>/SKILL.md` 发现可复用指令
 - MCP：从 `.claude/settings.json` 或 `~/.claude/settings.json` 加载外部工具服务器
+- Hooks：从 `.claude/settings.json` 或 `~/.claude/settings.json` 加载安全/权限 hook
 
 ## 安装
 
@@ -90,6 +91,63 @@ exit        退出
 
 会话保存在 `~/.forgecc/sessions`，工具大结果和记忆也保存在 `~/.forgecc` 下。
 
+## 安全 Hooks
+
+ForgeCC 支持 Claude Code 风格的 hook 配置，重点接入安全和权限相关事件：
+
+- `UserPromptSubmit`：用户输入进入模型前触发，可记录 prompt、阻断敏感信息、追加短上下文。
+- `PreToolUse`：工具执行前触发，可阻断危险 shell、`.env` 访问、越界写入。
+- `PermissionRequest`：需要权限确认时触发，可自动 allow/deny 或继续交给用户确认。
+- `PostToolUse`：工具成功后触发，可做写入后的 secret scan、代码安全检查、审计记录。
+- `PostToolUseFailure`：工具失败、被拒或被 hook 阻断后触发，可记录结构化安全事件。
+
+仓库自带的 `.claude/settings.json` 已启用默认安全策略，脚本在 `.claude/hooks/`：
+
+- `pre_tool_use.py`：阻断危险 shell、敏感文件访问、越界写入。
+- `permission_request.py`：对需要确认的操作做二次安全判断。
+- `post_tool_use.py`：检查写入内容和工具输出中的 secret-like 内容。
+- `post_tool_use_failure.py`：记录失败、拒绝、阻断事件。
+- `user_prompt_submit.py`：阻断用户 prompt 中疑似直接粘贴的 secret。
+
+也可以按项目需要调整 `.claude/settings.json`：
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "run_shell",
+        "hooks": [
+          {"type": "command", "command": "python .claude/hooks/pre_tool_use.py"}
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "",
+        "hooks": [
+          {"type": "command", "command": "python .claude/hooks/permission_request.py"}
+        ]
+      }
+    ]
+  }
+}
+```
+
+Hook 命令会从 stdin 收到 JSON payload。返回 exit code `2` 会阻断当前事件；也可以向 stdout 输出 JSON，例如：
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PermissionRequest",
+    "decision": {
+      "behavior": "deny",
+      "message": "Reading .env is not allowed"
+    }
+  }
+}
+```
+
 ## 项目结构
 
 ```text
@@ -104,6 +162,7 @@ src/mini_coding_agent/
   skills.py        skills 发现和解析
   subagent.py      子 Agent 配置
   mcp_client.py    MCP JSON-RPC over stdio 客户端
+  hooks.py         安全/权限 hook 加载和执行
   ui.py            终端输出
 ```
 
