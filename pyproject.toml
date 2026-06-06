@@ -4,12 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mini-coding-agent"
-version = "0.1.0"
-description = "A tiny Python CLI coding agent MVP for learning agent loops."
+version = "1.0.0"
+description = "ForgeCC, a learning-oriented Python coding agent inspired by Claude Code from scratch."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "openai>=1.0.0",
+    "openai>=1.50.0",
+    "rich>=13.0.0",
 ]
 
 [project.scripts]

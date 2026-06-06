@@ -1,3 +1,3 @@
-"""Mini Coding Agent."""
+"""ForgeCC — a learning-oriented Python coding agent built from scratch."""
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"
