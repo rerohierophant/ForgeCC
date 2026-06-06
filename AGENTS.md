@@ -45,8 +45,23 @@ export OPENAI_MODEL="gpt-4.1-mini"
 
 CLI flags can override model and API base URL:
 
-```powershell
+```bash
 cca --model gpt-4.1-mini --api-base https://api.openai.com/v1 "hello"
+```
+
+Optional shell sandboxing can be enabled in `.claude/settings.local.json` or `.claude/settings.json`:
+
+```json
+{
+  "sandbox": {
+    "enabled": true,
+    "allowNetwork": false,
+    "filesystem": {
+      "denyRead": ["~/.ssh", "~/.aws"],
+      "allowWrite": ["."]
+    }
+  }
+}
 ```
 
 ## Design Principles

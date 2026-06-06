@@ -8,8 +8,11 @@ import fnmatch
 import json
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from .memory import get_memory_dir
@@ -103,6 +106,10 @@ tool_definitions: list[ToolDef] = [
             "properties": {
                 "command": {"type": "string", "description": "The shell command to execute"},
                 "timeout": {"type": "number", "description": "Timeout in milliseconds (default: 30000)"},
+                "dangerouslyDisableSandbox": {
+                    "type": "boolean",
+                    "description": "Run outside the shell sandbox when sandbox settings allow unsandboxed commands.",
+                },
             },
             "required": ["command"],
         },
@@ -402,23 +409,283 @@ def _grep_python(pattern: str, directory: str, include: str | None) -> str:
     return output
 
 
+def _run_shell_process(command: str, timeout_s: float) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        shell=True,
+        capture_output=True,
+        text=True,
+        timeout=timeout_s,
+    )
+
+
+def _run_shell_argv(argv: list[str], timeout_s: float) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        argv,
+        shell=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout_s,
+    )
+
+
+def _format_shell_result(result: subprocess.CompletedProcess[str]) -> str:
+    output = result.stdout or ""
+    if result.returncode != 0:
+        stderr = f"\nStderr: {result.stderr}" if result.stderr else ""
+        stdout = f"\nStdout: {result.stdout}" if result.stdout else ""
+        return f"Command failed (exit code {result.returncode}){stdout}{stderr}"
+    return output or "(no output)"
+
+
+def _with_sandbox_status(result: str, status: str, reason: str = "") -> str:
+    suffix = f" - {reason}" if reason else ""
+    return f"[sandbox: {status}{suffix}]\n{result}"
+
+
+def _load_ordered_settings() -> list[dict]:
+    files = [
+        Path.home() / ".claude" / "settings.json",
+        Path.cwd() / ".claude" / "settings.json",
+        Path.cwd() / ".claude" / "settings.local.json",
+    ]
+    return [settings for file_path in files if (settings := _load_settings(file_path))]
+
+
+def _env_flag(name: str) -> bool | None:
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _sandbox_path(path: str) -> str:
+    expanded = os.path.expandvars(os.path.expanduser(path))
+    if not os.path.isabs(expanded):
+        expanded = str(Path.cwd() / expanded)
+    return str(Path(expanded).resolve())
+
+
+def _sandbox_config() -> dict:
+    config = {
+        "enabled": False,
+        "failIfUnavailable": False,
+        "allowUnsandboxedCommands": True,
+        "excludedCommands": [],
+        "allowNetwork": False,
+        "filesystem": {
+            "allowRead": [],
+            "denyRead": [],
+            "allowWrite": [],
+            "denyWrite": [],
+        },
+    }
+
+    for settings in _load_ordered_settings():
+        sandbox = settings.get("sandbox")
+        if not isinstance(sandbox, dict):
+            continue
+
+        for key in ("enabled", "failIfUnavailable", "allowUnsandboxedCommands"):
+            if key in sandbox:
+                config[key] = bool(sandbox[key])
+
+        if "allowNetwork" in sandbox:
+            config["allowNetwork"] = bool(sandbox["allowNetwork"])
+        network = sandbox.get("network")
+        if isinstance(network, dict) and "allow" in network:
+            config["allowNetwork"] = bool(network["allow"])
+
+        excluded = sandbox.get("excludedCommands")
+        if isinstance(excluded, list):
+            config["excludedCommands"].extend(str(item) for item in excluded)
+
+        fs = sandbox.get("filesystem")
+        if isinstance(fs, dict):
+            for key in ("allowRead", "denyRead", "allowWrite", "denyWrite"):
+                values = fs.get(key)
+                if isinstance(values, list):
+                    config["filesystem"][key].extend(str(value) for value in values)
+
+    env_enabled = _env_flag("CCA_SANDBOX")
+    if env_enabled is not None:
+        config["enabled"] = env_enabled
+
+    return config
+
+
+def _split_shell_segments(command: str) -> list[str]:
+    return [
+        segment.strip()
+        for segment in re.split(r"\s*(?:&&|\|\||;|\|)\s*", command)
+        if segment.strip()
+    ]
+
+
+def _first_command_token(segment: str) -> str:
+    try:
+        tokens = shlex.split(segment, posix=not IS_WIN)
+    except ValueError:
+        return segment.strip().split()[0] if segment.strip() else ""
+
+    while tokens:
+        token = tokens[0]
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
+            tokens.pop(0)
+            continue
+        if token in {"command", "exec"}:
+            tokens.pop(0)
+            continue
+        if token == "env":
+            tokens.pop(0)
+            while tokens and (tokens[0].startswith("-") or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[0])):
+                tokens.pop(0)
+            continue
+        break
+    return tokens[0] if tokens else ""
+
+
+def _matches_excluded_command(command: str, patterns: list[str]) -> bool:
+    if not patterns:
+        return False
+
+    for segment in _split_shell_segments(command):
+        token = _first_command_token(segment)
+        token_name = os.path.basename(token)
+        for pattern in patterns:
+            if (
+                fnmatch.fnmatch(segment, pattern)
+                or fnmatch.fnmatch(token, pattern)
+                or fnmatch.fnmatch(token_name, pattern)
+            ):
+                return True
+    return False
+
+
+def _should_use_sandbox(inp: dict, config: dict) -> tuple[bool, str]:
+    command = inp.get("command", "")
+    if not config["enabled"]:
+        return False, "disabled"
+    if sys.platform != "darwin":
+        return False, "unsupported platform"
+    if inp.get("dangerouslyDisableSandbox") and config["allowUnsandboxedCommands"]:
+        return False, "disabled for command"
+    if _matches_excluded_command(command, config["excludedCommands"]):
+        return False, "excluded command"
+    return True, ""
+
+
+def _sandbox_profile(config: dict) -> str:
+    workspace = str(Path.cwd().resolve())
+    temp_paths = {
+        tempfile.gettempdir(),
+        "/tmp",
+        "/private/tmp",
+        os.environ.get("TMPDIR", ""),
+    }
+
+    allow_write = [workspace, *temp_paths, *config["filesystem"]["allowWrite"]]
+    deny_write = config["filesystem"]["denyWrite"]
+    allow_read = config["filesystem"]["allowRead"]
+    deny_read = config["filesystem"]["denyRead"]
+
+    lines = [
+        "(version 1)",
+        "(allow default)",
+        "(deny file-write*)",
+    ]
+
+    if not config["allowNetwork"]:
+        lines.extend([
+            "(deny network-outbound)",
+            "(deny network-inbound)",
+        ])
+
+    for path in deny_read:
+        lines.append(f'(deny file-read* (subpath "{_escape_sbpl_string(_sandbox_path(path))}"))')
+    for path in allow_read:
+        lines.append(f'(allow file-read* (subpath "{_escape_sbpl_string(_sandbox_path(path))}"))')
+    for path in deny_write:
+        lines.append(f'(deny file-write* (subpath "{_escape_sbpl_string(_sandbox_path(path))}"))')
+    for path in allow_write:
+        if path:
+            lines.append(f'(allow file-write* (subpath "{_escape_sbpl_string(_sandbox_path(path))}"))')
+
+    lines.extend([
+        '(allow file-write* (literal "/dev/null"))',
+        '(allow file-write* (literal "/dev/tty"))',
+    ])
+    return "\n".join(lines) + "\n"
+
+
+def _escape_sbpl_string(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _sandbox_shell() -> str:
+    shell = os.environ.get("SHELL", "/bin/zsh")
+    if os.path.basename(shell) not in {"bash", "zsh", "sh"}:
+        return "/bin/zsh"
+    return shell
+
+
+def _run_sandboxed_shell(command: str, timeout_s: float, config: dict) -> str:
+    sandbox_exec = shutil.which("sandbox-exec")
+    if not sandbox_exec:
+        if config["failIfUnavailable"]:
+            return _with_sandbox_status(
+                "Error: sandbox-exec is unavailable and sandbox.failIfUnavailable is enabled.",
+                "unavailable",
+                "sandbox-exec not found",
+            )
+        result = _run_shell_process(command, timeout_s)
+        return _with_sandbox_status(
+            _format_shell_result(result),
+            "fallback",
+            "sandbox-exec not found; ran without sandbox",
+        )
+
+    profile = _sandbox_profile(config)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".sb", delete=False) as profile_file:
+        profile_file.write(profile)
+        profile_path = profile_file.name
+
+    try:
+        result = _run_shell_argv(
+            [sandbox_exec, "-f", profile_path, _sandbox_shell(), "-lc", command],
+            timeout_s,
+        )
+        if result.returncode == 71 and "sandbox_apply" in (result.stderr or ""):
+            if config["failIfUnavailable"]:
+                return _with_sandbox_status(
+                    f"Error: sandbox failed to start: {result.stderr.strip()}",
+                    "unavailable",
+                    "sandbox-exec failed to start",
+                )
+            fallback_result = _run_shell_process(command, timeout_s)
+            return _with_sandbox_status(
+                _format_shell_result(fallback_result),
+                "fallback",
+                "sandbox-exec failed to start; ran without sandbox",
+            )
+        return _with_sandbox_status(_format_shell_result(result), "sandboxed")
+    finally:
+        try:
+            os.unlink(profile_path)
+        except OSError:
+            pass
+
+
 def _run_shell(inp: dict) -> str:
     try:
         timeout_ms = inp.get("timeout", 30000)
         timeout_s = timeout_ms / 1000
-        result = subprocess.run(
-            inp["command"],
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-        )
-        output = result.stdout or ""
-        if result.returncode != 0:
-            stderr = f"\nStderr: {result.stderr}" if result.stderr else ""
-            stdout = f"\nStdout: {result.stdout}" if result.stdout else ""
-            return f"Command failed (exit code {result.returncode}){stdout}{stderr}"
-        return output or "(no output)"
+        config = _sandbox_config()
+        use_sandbox, reason = _should_use_sandbox(inp, config)
+        if use_sandbox:
+            return _run_sandboxed_shell(inp["command"], timeout_s, config)
+        result = _format_shell_result(_run_shell_process(inp["command"], timeout_s))
+        return _with_sandbox_status(result, "unsandboxed", reason)
     except subprocess.TimeoutExpired:
         return f"Command timed out after {inp.get('timeout', 30000)}ms"
     except Exception as e:
@@ -599,7 +866,10 @@ def check_permission(
     needs_confirm = False
     confirm_message = ""
 
-    if tool_name == "run_shell" and is_dangerous(inp.get("command", "")):
+    if tool_name == "run_shell" and inp.get("dangerouslyDisableSandbox"):
+        needs_confirm = True
+        confirm_message = f"run without sandbox: {inp.get('command', '')}"
+    elif tool_name == "run_shell" and is_dangerous(inp.get("command", "")):
         needs_confirm = True
         confirm_message = inp.get("command", "")
     elif tool_name == "write_file" and not Path(inp.get("file_path", "")).exists():
