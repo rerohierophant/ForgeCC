@@ -24,6 +24,10 @@ from .tools import (
     CONCURRENCY_SAFE_TOOLS,
     ORCHESTRATION_TOOLS,
     TASK_TOOLS,
+    TEAM_TOOLS,
+    TEAM_MEMBER_TOOLS,
+    WORKTREE_TOOLS,
+    MCP_RUNTIME_TOOLS,
     get_active_tool_definitions,
     ToolDef,
 )
@@ -53,6 +57,8 @@ from .subagent import get_sub_agent_config
 from .mcp_client import McpManager
 from .hooks import run_hooks
 from .tasks import TaskManager
+from .teams import TeamManager
+from .worktrees import WorktreeManager
 
 # ─── Retry with exponential backoff ──────────────────────────
 
@@ -167,6 +173,11 @@ class Agent:
         custom_tools: list[ToolDef] | None = None,
         is_sub_agent: bool = False,
         coordinator_mode: bool = False,
+        team_manager: TeamManager | None = None,
+        worktree_manager: WorktreeManager | None = None,
+        team_id: str | None = None,
+        team_member: str | None = None,
+        cwd: str | None = None,
     ):
         self.permission_mode = permission_mode
         self.model = model
@@ -174,6 +185,9 @@ class Agent:
         self.api_key = api_key
         self.is_sub_agent = is_sub_agent
         self.coordinator_mode = coordinator_mode
+        self.team_id = team_id
+        self.team_member = team_member
+        self.cwd = str(Path(cwd).resolve()) if cwd else str(Path.cwd().resolve())
         if custom_tools is not None:
             self.tools = custom_tools
         elif coordinator_mode:
@@ -215,8 +229,15 @@ class Agent:
         # Background sub-agent tasks for coordinator-style multi-agent work
         self._task_manager = TaskManager()
 
+        # Persistent team runtime for swarm-style multi-agent work
+        self._team_manager = team_manager or TeamManager()
+        self._worktree_manager = worktree_manager or WorktreeManager()
+
         # Read-before-edit: track file read timestamps (absolutePath → mtime)
         self._read_file_state: dict[str, float] = {}
+
+        # Session-level todo list maintained by todo_write
+        self._todos: list[dict] = []
 
         # MCP integration
         self._mcp_manager = McpManager()
@@ -339,7 +360,7 @@ class Agent:
     def _hook_base_payload(self) -> dict:
         return {
             "session_id": self.session_id,
-            "cwd": str(Path.cwd()),
+            "cwd": self.cwd,
             "permission_mode": self.permission_mode,
             "model": self.model,
             "is_sub_agent": self.is_sub_agent,
@@ -412,6 +433,12 @@ class Agent:
         self._sync_task_usage()
         print_info(self._task_manager.format_status())
 
+    def show_teams(self) -> None:
+        print_info(self._team_manager.format_status())
+
+    def show_todos(self) -> None:
+        print_info(self._format_todos())
+
     def _get_current_cost_usd(self) -> float:
         uncached_input = max(0, self.total_input_tokens - self.total_cached_input_tokens)
         discounted_cached_input = self.total_cached_input_tokens * 0.10
@@ -432,6 +459,8 @@ class Agent:
     def restore_session(self, data: dict) -> None:
         if data.get("openaiMessages"):
             self._openai_messages = data["openaiMessages"]
+        if isinstance(data.get("todos"), list):
+            self._todos = data["todos"]
         print_info(f"Session restored ({self._get_message_count()} messages).")
 
     def _get_message_count(self) -> int:
@@ -448,6 +477,7 @@ class Agent:
                     "messageCount": self._get_message_count(),
                 },
                 "openaiMessages": self._openai_messages,
+                "todos": self._todos,
             })
         except Exception:
             pass
@@ -572,12 +602,20 @@ class Agent:
             return await self._execute_agent_tool(inp)
         if name in TASK_TOOLS:
             return self._execute_task_tool(name, inp)
+        if name in TEAM_TOOLS or name in TEAM_MEMBER_TOOLS:
+            return await self._execute_team_tool(name, inp)
+        if name in WORKTREE_TOOLS:
+            return self._execute_worktree_tool(name, inp)
+        if name == "todo_write":
+            return self._execute_todo_write(inp)
+        if name in MCP_RUNTIME_TOOLS:
+            return await self._mcp_manager.call_runtime_tool(name, inp)
         if name == "skill":
             return await self._execute_skill_tool(inp)
         # Route MCP tool calls to the MCP manager
         if self._mcp_manager.is_mcp_tool(name):
             return await self._mcp_manager.call_tool(name, inp)
-        return await execute_tool(name, inp, self._read_file_state)
+        return await execute_tool(name, inp, self._read_file_state, self.cwd)
 
     async def _run_pre_tool_use_hook(self, tool_name: str, inp: dict, tool_use_id: str) -> dict:
         hook = await run_hooks(
@@ -768,6 +806,12 @@ synthesize their findings into one concise final answer.
 - Use task_status to monitor all running workers.
 - Use task_output to read completed worker results.
 - Use task_stop only when a worker is clearly no longer useful.
+- Use tool_search to load team tools when the user asks for a persistent swarm
+  or autonomous agent team.
+- Use team_create/team_status/team_message/team_wake/team_stop for persistent
+  agent teams with a shared task board and mailbox.
+- Use worktree_status/worktree_diff/worktree_commit/worktree_merge to review and
+  integrate isolated write-capable team member worktrees.
 
 ## Constraints
 - Do not try to edit files, read files, or run shell commands yourself.
@@ -964,6 +1008,318 @@ synthesize their findings into one concise final answer.
             self.total_output_tokens += record.tokens.get("output", 0)
             self.total_cached_input_tokens += record.tokens.get("cached_input", 0)
             record.token_accounted = True
+
+    def _execute_todo_write(self, inp: dict) -> str:
+        todos = inp.get("todos")
+        if not isinstance(todos, list):
+            return "Error: todos must be a list."
+        normalized: list[dict] = []
+        in_progress = 0
+        valid_status = {"pending", "in_progress", "completed"}
+        valid_priority = {"low", "medium", "high"}
+        for idx, item in enumerate(todos, start=1):
+            if not isinstance(item, dict):
+                return f"Error: todo #{idx} must be an object."
+            content = str(item.get("content") or "").strip()
+            status = str(item.get("status") or "pending")
+            priority = str(item.get("priority") or "medium")
+            if not content:
+                return f"Error: todo #{idx} content is required."
+            if status not in valid_status:
+                return f"Error: invalid status for todo #{idx}: {status}"
+            if priority not in valid_priority:
+                return f"Error: invalid priority for todo #{idx}: {priority}"
+            if status == "in_progress":
+                in_progress += 1
+            normalized.append({
+                "id": str(item.get("id") or f"todo-{idx}"),
+                "content": content,
+                "status": status,
+                "priority": priority,
+            })
+        if in_progress > 1:
+            return "Error: only one todo can be in_progress at a time."
+        self._todos = normalized
+        return "Todo list updated.\n\n" + self._format_todos()
+
+    def _format_todos(self) -> str:
+        if not self._todos:
+            return "No todos."
+        marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}
+        return "\n".join(
+            f"{marker.get(todo['status'], '[ ]')} {todo['id']} ({todo['priority']}): {todo['content']}"
+            for todo in self._todos
+        )
+
+    async def _execute_team_tool(self, name: str, inp: dict) -> str:
+        if name in TEAM_MEMBER_TOOLS:
+            return self._execute_team_member_tool(name, inp)
+
+        if name == "team_create":
+            team = self._team_manager.create_team(
+                name=inp.get("name") or "Swarm Team",
+                agents=inp.get("agents") or [],
+                initial_tasks=inp.get("initial_tasks") or [],
+            )
+            self._ensure_team_worktrees(team.id)
+            self._ensure_team_loops(team.id)
+            for agent_name in team.agents:
+                self._team_manager.wake_agent(team.id, agent_name)
+            return (
+                f"Created team {team.id}: {team.name}\n\n"
+                f"{self._team_manager.format_status(team.id)}\n\n"
+                "Team members are live and will autonomously read the board, claim tasks, send messages, and idle."
+            )
+
+        if name == "team_status":
+            return self._team_manager.format_status(inp.get("team_id"))
+
+        if name == "team_add_task":
+            team_id = inp.get("team_id")
+            task = self._team_manager.add_task(
+                team_id,
+                title=inp.get("title") or "Untitled task",
+                description=inp.get("description") or "",
+            )
+            if not task:
+                return f"Unknown team: {team_id}"
+            self._ensure_team_loops(team_id)
+            team = self._team_manager.get(team_id)
+            if team:
+                for agent_name in team.agents:
+                    self._team_manager.wake_agent(team_id, agent_name)
+            return f"Added task {task.id} to team {team_id}: {task.title}"
+
+        if name == "team_message":
+            team_id = inp.get("team_id")
+            try:
+                msg = self._team_manager.send_message(
+                    team_id,
+                    sender="coordinator",
+                    recipient=inp.get("to") or "all",
+                    content=inp.get("content") or "",
+                    kind=inp.get("kind") or "REQUEST",
+                    thread_id=inp.get("thread_id") or None,
+                )
+            except ValueError as exc:
+                return f"Error: {exc}"
+            if not msg:
+                return f"Unknown team: {team_id}"
+            self._ensure_team_loops(team_id)
+            self._team_manager.wake_recipient(team_id, msg.recipient)
+            return f"Sent message {msg.id} to {msg.recipient} in team {team_id}."
+
+        if name == "team_wake":
+            team_id = inp.get("team_id")
+            self._ensure_team_worktrees(team_id)
+            self._ensure_team_loops(team_id)
+            team = self._team_manager.get(team_id)
+            if not team:
+                return f"Unknown team: {team_id}"
+            target = inp.get("agent")
+            if target:
+                ok = self._team_manager.wake_agent(team_id, target)
+                return f"Woke {target}." if ok else f"Unknown or inactive agent: {target}"
+            for agent_name in team.agents:
+                self._team_manager.wake_agent(team_id, agent_name)
+            return f"Woke {len(team.agents)} agents in team {team_id}."
+
+        if name == "team_stop":
+            return self._team_manager.stop_team(inp.get("team_id") or "")
+
+        if name == "team_compact":
+            return self._team_manager.compact(inp.get("team_id") or "")
+
+        return f"Unknown team tool: {name}"
+
+    def _execute_team_member_tool(self, name: str, inp: dict) -> str:
+        if not self.team_id or not self.team_member:
+            return f"Error: {name} is only available inside a team member agent."
+
+        if name == "team_read_board":
+            return self._team_manager.format_board(self.team_id)
+
+        if name == "team_read_messages":
+            unread_only = inp.get("unread_only", True)
+            messages = self._team_manager.read_messages(self.team_id, self.team_member, unread_only=bool(unread_only))
+            if not messages:
+                return "No messages."
+            return "\n".join(
+                self._team_manager.format_message(msg)
+                for msg in messages
+            )
+
+        if name == "team_claim_task":
+            task = self._team_manager.claim_task(self.team_id, self.team_member, inp.get("task_id"))
+            if not task:
+                return "No open task available to claim."
+            return f"Claimed task {task.id}: {task.title}\n{task.description}"
+
+        if name == "team_update_task":
+            task = self._team_manager.update_task(
+                self.team_id,
+                self.team_member,
+                task_id=inp.get("task_id") or "",
+                status=inp.get("status") or "claimed",
+                note=inp.get("note") or "",
+                result=inp.get("result") or "",
+            )
+            if not task:
+                return f"Unknown task: {inp.get('task_id')}"
+            if task.status in {"done", "blocked"}:
+                self._team_manager.send_message(
+                    self.team_id,
+                    sender=self.team_member,
+                    recipient="all",
+                    content=f"Task {task.id} is {task.status}: {task.title}",
+                    kind="BLOCKED" if task.status == "blocked" else "STATUS",
+                    thread_id=task.id,
+                )
+            return f"Updated task {task.id}: {task.status}"
+
+        if name == "team_send_message":
+            try:
+                msg = self._team_manager.send_message(
+                    self.team_id,
+                    sender=self.team_member,
+                    recipient=inp.get("to") or "all",
+                    content=inp.get("content") or "",
+                    kind=inp.get("kind") or "STATUS",
+                    thread_id=inp.get("thread_id") or None,
+                )
+            except ValueError as exc:
+                return f"Error: {exc}"
+            if not msg:
+                return f"Unknown team: {self.team_id}"
+            return f"Sent message {msg.id} to {msg.recipient}."
+
+        if name == "team_idle":
+            reason = inp.get("reason") or "No active work."
+            self._team_manager.request_idle(self.team_id, self.team_member)
+            self._team_manager.mark_agent(self.team_id, self.team_member, "idle")
+            return f"{self.team_member} is idle: {reason}"
+
+        return f"Unknown team member tool: {name}"
+
+    def _execute_worktree_tool(self, name: str, inp: dict) -> str:
+        if name == "worktree_create":
+            try:
+                record = self._worktree_manager.create(
+                    agent=inp.get("agent") or "",
+                    branch=inp.get("branch") or None,
+                    base_ref=inp.get("base_ref") or "HEAD",
+                )
+                return f"Worktree for {record.agent}\nbranch: {record.branch}\npath: {record.path}"
+            except Exception as exc:
+                return f"Error creating worktree: {exc}"
+        if name == "worktree_status":
+            return self._worktree_manager.status(inp.get("agent"))
+        if name == "worktree_diff":
+            return self._worktree_manager.diff(
+                inp.get("agent") or "",
+                max_chars=int(inp.get("max_chars") or 20000),
+            )
+        if name == "worktree_commit":
+            return self._worktree_manager.commit(inp.get("agent") or "", inp.get("message") or "swarm worktree changes")
+        if name == "worktree_merge":
+            return self._worktree_manager.merge(inp.get("agent") or "")
+        if name == "worktree_cleanup":
+            return self._worktree_manager.cleanup(inp.get("agent") or "", force=bool(inp.get("force")))
+        return f"Unknown worktree tool: {name}"
+
+    def _ensure_team_worktrees(self, team_id: str | None) -> None:
+        if not team_id:
+            return
+        team = self._team_manager.get(team_id)
+        if not team:
+            return
+        changed = False
+        for agent in team.agents.values():
+            if not agent.worktree or agent.worktree_path:
+                continue
+            record = self._worktree_manager.create(agent=f"{team_id}-{agent.name}")
+            agent.worktree_path = record.path
+            agent.branch = record.branch
+            changed = True
+        if changed:
+            self._team_manager._save(team_id)
+
+    def _ensure_team_loops(self, team_id: str | None) -> None:
+        if not team_id:
+            return
+        team = self._team_manager.get(team_id)
+        if not team:
+            return
+        for agent_name, agent_state in team.agents.items():
+            async def _runner(name: str = agent_name, state=agent_state) -> None:
+                member_agent = Agent(
+                    model=self.model,
+                    api_base=self.api_base,
+                    api_key=self.api_key,
+                    custom_system_prompt=self._build_team_member_prompt(team_id, name, state.role),
+                    custom_tools=self._build_team_member_tools(state.agent_type),
+                    is_sub_agent=True,
+                    permission_mode=self.permission_mode,
+                    confirm_fn=self.confirm_fn,
+                    team_manager=self._team_manager,
+                    worktree_manager=self._worktree_manager,
+                    team_id=team_id,
+                    team_member=name,
+                    cwd=state.worktree_path or self.cwd,
+                )
+                while True:
+                    await self._team_manager.wait_for_wake(team_id, name)
+                    self._team_manager.mark_agent(team_id, name, "running")
+                    try:
+                        await member_agent.chat(self._build_team_wake_prompt(team_id, name))
+                        self._team_manager.update_agent_tokens(team_id, name, member_agent.get_token_usage())
+                        self._team_manager.mark_agent(team_id, name, "idle")
+                    except asyncio.CancelledError:
+                        self._team_manager.mark_agent(team_id, name, "stopped")
+                        raise
+                    except Exception as exc:
+                        self._team_manager.mark_agent(team_id, name, "idle", str(exc))
+
+            self._team_manager.register_loop(team_id, agent_name, _runner)
+
+    def _build_team_member_tools(self, agent_type: str) -> list[ToolDef]:
+        config = get_sub_agent_config(agent_type)
+        base_tools = [
+            t for t in config["tools"]
+            if t["name"] not in ORCHESTRATION_TOOLS and t["name"] not in TEAM_MEMBER_TOOLS
+        ]
+        member_tools = [
+            {k: v for k, v in t.items() if k != "deferred"}
+            for t in tool_definitions
+            if t["name"] in TEAM_MEMBER_TOOLS
+        ]
+        return base_tools + member_tools
+
+    def _build_team_member_prompt(self, team_id: str, agent_name: str, role: str) -> str:
+        return f"""You are {agent_name}, a persistent member of ForgeCC team {team_id}.
+
+Role: {role}
+
+You participate in a shared task board and mailbox. On each wake:
+1. Read your messages with team_read_messages.
+2. Read the board with team_read_board.
+3. Claim an open task if one matches your role, or continue your claimed task.
+4. Use your normal code tools as needed.
+5. Update task status with team_update_task.
+6. Send messages to teammates when coordination is useful. Use kind=REQUEST
+   when asking for work, REPLY when answering a message (include thread_id),
+   STATUS for progress, and BLOCKED when blocked.
+7. Call team_idle when there is no useful next action.
+
+Do not wait for the coordinator to assign every step. Prefer small, clear task
+updates and concise messages. If you are blocked, mark the task blocked with a
+specific reason."""
+
+    def _build_team_wake_prompt(self, team_id: str, agent_name: str) -> str:
+        return (
+            f"You have been woken in team {team_id} as {agent_name}. "
+            "Check your mailbox and the shared board, act on useful work, then call team_idle when done."
+        )
 
     # ─── OpenAI-compatible backend ───────────────────────────────
 

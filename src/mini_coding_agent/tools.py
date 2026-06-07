@@ -24,8 +24,14 @@ PermissionMode = str  # "default" | "plan" | "acceptEdits" | "bypassPermissions"
 
 READ_TOOLS = {"read_file", "list_files", "grep_search", "web_fetch"}
 EDIT_TOOLS = {"write_file", "edit_file"}
+TODO_TOOLS = {"todo_write"}
 TASK_TOOLS = {"task_status", "task_output", "task_stop"}
-ORCHESTRATION_TOOLS = {"agent", *TASK_TOOLS}
+TEAM_TOOLS = {"team_create", "team_status", "team_add_task", "team_message", "team_wake", "team_stop", "team_compact"}
+TEAM_MEMBER_TOOLS = {"team_read_board", "team_read_messages", "team_claim_task", "team_update_task", "team_send_message", "team_idle"}
+WORKTREE_TOOLS = {"worktree_create", "worktree_status", "worktree_diff", "worktree_commit", "worktree_merge", "worktree_cleanup"}
+WORKTREE_CONFIRM_TOOLS = {"worktree_commit", "worktree_merge", "worktree_cleanup"}
+MCP_RUNTIME_TOOLS = {"mcp_list_resources", "mcp_read_resource", "mcp_subscribe_resource", "mcp_unsubscribe_resource", "mcp_poll", "mcp_oauth_status"}
+ORCHESTRATION_TOOLS = {"agent", "tool_search", *TASK_TOOLS, *TEAM_TOOLS, *WORKTREE_TOOLS}
 
 # Concurrency-safe tools can run in parallel (read-only, no side effects)
 CONCURRENCY_SAFE_TOOLS = {"read_file", "list_files", "grep_search", "web_fetch"}
@@ -141,6 +147,29 @@ tool_definitions: list[ToolDef] = [
         },
     },
     {
+        "name": "todo_write",
+        "description": "Create or update the current session todo list. Use this for multi-step tasks to track pending, in_progress, and completed work.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string", "description": "Stable todo id. If omitted, one is generated from position."},
+                            "content": {"type": "string"},
+                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                            "priority": {"type": "string", "enum": ["low", "medium", "high"]},
+                        },
+                        "required": ["content", "status", "priority"],
+                    },
+                },
+            },
+            "required": ["todos"],
+        },
+    },
+    {
         "name": "enter_plan_mode",
         "description": "Enter plan mode to switch to a read-only planning phase. In plan mode, you can only read files and write to the plan file.",
         "input_schema": {"type": "object", "properties": {}},
@@ -210,6 +239,334 @@ tool_definitions: list[ToolDef] = [
             "required": ["task_id"],
         },
     },
+    {
+        "name": "team_create",
+        "description": "Create a persistent autonomous agent team with named members, a shared task board, mailbox, and idle/wake loops.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Human-readable team name"},
+                "agents": {
+                    "type": "array",
+                    "description": "Team members to create",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "role": {"type": "string"},
+                            "type": {"type": "string", "enum": ["explore", "plan", "general"]},
+                            "worktree": {"type": "boolean", "description": "Whether this member should edit inside an isolated git worktree. Defaults to true for general agents."},
+                        },
+                        "required": ["name", "role"],
+                    },
+                },
+                "initial_tasks": {
+                    "type": "array",
+                    "description": "Initial shared task-board tasks",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "description": {"type": "string"},
+                        },
+                        "required": ["title", "description"],
+                    },
+                },
+            },
+            "required": ["name", "agents"],
+        },
+        "deferred": True,
+    },
+    {
+        "name": "team_status",
+        "description": "Show status for persistent agent teams. Omit team_id to list all teams.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "team_id": {"type": "string"},
+            },
+        },
+        "deferred": True,
+    },
+    {
+        "name": "team_add_task",
+        "description": "Add a task to a team's shared task board and wake the team.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "team_id": {"type": "string"},
+                "title": {"type": "string"},
+                "description": {"type": "string"},
+            },
+            "required": ["team_id", "title", "description"],
+        },
+        "deferred": True,
+    },
+    {
+        "name": "team_message",
+        "description": "Send a message to one team member or all members and wake recipients.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "team_id": {"type": "string"},
+                "to": {"type": "string", "description": "Agent name or 'all'"},
+                "kind": {"type": "string", "enum": ["REQUEST", "REPLY", "STATUS", "BLOCKED"], "description": "Structured team protocol message kind."},
+                "content": {"type": "string"},
+                "thread_id": {"type": "string", "description": "Optional task/message id this message relates to."},
+            },
+            "required": ["team_id", "to", "content"],
+        },
+        "deferred": True,
+    },
+    {
+        "name": "team_wake",
+        "description": "Wake a live team member, or all members if agent is omitted.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "team_id": {"type": "string"},
+                "agent": {"type": "string"},
+            },
+            "required": ["team_id"],
+        },
+        "deferred": True,
+    },
+    {
+        "name": "team_stop",
+        "description": "Stop all live agent loops for a team.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "team_id": {"type": "string"},
+            },
+            "required": ["team_id"],
+        },
+        "deferred": True,
+    },
+    {
+        "name": "team_compact",
+        "description": "Compact a team's persisted state by summarizing completed work and trimming old messages.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "team_id": {"type": "string"},
+            },
+            "required": ["team_id"],
+        },
+        "deferred": True,
+    },
+    {
+        "name": "team_read_board",
+        "description": "Team-member tool: read the shared team task board and teammate status.",
+        "input_schema": {"type": "object", "properties": {}},
+        "deferred": True,
+    },
+    {
+        "name": "team_read_messages",
+        "description": "Team-member tool: read mailbox messages addressed to this agent or all agents.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "unread_only": {"type": "boolean", "description": "Only return unread messages. Default true."},
+            },
+        },
+        "deferred": True,
+    },
+    {
+        "name": "team_claim_task",
+        "description": "Team-member tool: claim an open task from the shared task board. Omit task_id to claim the first open task.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string"},
+            },
+        },
+        "deferred": True,
+    },
+    {
+        "name": "team_update_task",
+        "description": "Team-member tool: update a task's status and optionally record a note or final result.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string"},
+                "status": {"type": "string", "enum": ["open", "claimed", "done", "blocked", "cancelled"]},
+                "note": {"type": "string"},
+                "result": {"type": "string"},
+            },
+            "required": ["task_id", "status"],
+        },
+        "deferred": True,
+    },
+    {
+        "name": "team_send_message",
+        "description": "Team-member tool: send a message to another team member or all members.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string", "description": "Agent name or 'all'"},
+                "kind": {"type": "string", "enum": ["REQUEST", "REPLY", "STATUS", "BLOCKED"], "description": "Structured team protocol message kind."},
+                "content": {"type": "string"},
+                "thread_id": {"type": "string", "description": "Optional task/message id this message relates to."},
+            },
+            "required": ["to", "content"],
+        },
+        "deferred": True,
+    },
+    {
+        "name": "team_idle",
+        "description": "Team-member tool: mark yourself idle until another task or message wakes you.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reason": {"type": "string"},
+            },
+        },
+        "deferred": True,
+    },
+    {
+        "name": "worktree_create",
+        "description": "Create or return a managed git worktree for an agent. Team agents with worktree=true get one automatically.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "agent": {"type": "string", "description": "Agent/member name"},
+                "branch": {"type": "string", "description": "Optional branch name. Defaults to codex/swarm/<agent>."},
+                "base_ref": {"type": "string", "description": "Base ref for the new worktree. Defaults to HEAD."},
+            },
+            "required": ["agent"],
+        },
+        "deferred": True,
+    },
+    {
+        "name": "worktree_status",
+        "description": "Show status for managed worktrees. Omit agent to list all.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "agent": {"type": "string"},
+            },
+        },
+        "deferred": True,
+    },
+    {
+        "name": "worktree_diff",
+        "description": "Show the uncommitted diff for a managed worktree.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "agent": {"type": "string"},
+                "max_chars": {"type": "number"},
+            },
+            "required": ["agent"],
+        },
+        "deferred": True,
+    },
+    {
+        "name": "worktree_commit",
+        "description": "Commit all changes in a managed worktree. Requires user confirmation in normal permission modes.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "agent": {"type": "string"},
+                "message": {"type": "string"},
+            },
+            "required": ["agent", "message"],
+        },
+        "deferred": True,
+    },
+    {
+        "name": "worktree_merge",
+        "description": "Merge a managed worktree branch into the main repository. Requires user confirmation in normal permission modes.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "agent": {"type": "string"},
+            },
+            "required": ["agent"],
+        },
+        "deferred": True,
+    },
+    {
+        "name": "worktree_cleanup",
+        "description": "Remove a managed worktree. Requires user confirmation in normal permission modes.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "agent": {"type": "string"},
+                "force": {"type": "boolean"},
+            },
+            "required": ["agent"],
+        },
+        "deferred": True,
+    },
+    {
+        "name": "mcp_list_resources",
+        "description": "List resources exposed by connected MCP servers, optionally for one server.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "server": {"type": "string", "description": "Optional MCP server name"},
+            },
+        },
+    },
+    {
+        "name": "mcp_read_resource",
+        "description": "Read one MCP resource by URI from a connected server.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "server": {"type": "string"},
+                "uri": {"type": "string"},
+            },
+            "required": ["server", "uri"],
+        },
+    },
+    {
+        "name": "mcp_subscribe_resource",
+        "description": "Subscribe to updates for one MCP resource. Updates are available via mcp_poll.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "server": {"type": "string"},
+                "uri": {"type": "string"},
+            },
+            "required": ["server", "uri"],
+        },
+    },
+    {
+        "name": "mcp_unsubscribe_resource",
+        "description": "Unsubscribe from updates for one MCP resource.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "server": {"type": "string"},
+                "uri": {"type": "string"},
+            },
+            "required": ["server", "uri"],
+        },
+    },
+    {
+        "name": "mcp_poll",
+        "description": "Poll queued MCP notifications and subscription updates.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "server": {"type": "string", "description": "Optional MCP server name"},
+                "max_events": {"type": "number"},
+            },
+        },
+    },
+    {
+        "name": "mcp_oauth_status",
+        "description": "Show OAuth-related configuration/status for connected MCP servers. ForgeCC reports status and required env vars; interactive OAuth browser flows are not performed by the CLI.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "server": {"type": "string", "description": "Optional MCP server name"},
+            },
+        },
+    },
     # ─── Tool search (deferred tool loader) ─────────────────────
     {
         "name": "tool_search",
@@ -253,9 +610,17 @@ def get_deferred_tool_names(all_tools: list[ToolDef] | None = None) -> list[str]
 # ─── Tool execution ─────────────────────────────────────────
 
 
+def _tool_path(inp: dict, key: str = "file_path") -> Path:
+    path = Path(inp[key])
+    if path.is_absolute():
+        return path
+    cwd = inp.get("_cwd")
+    return (Path(cwd) / path) if cwd else path
+
+
 def _read_file(inp: dict) -> str:
     try:
-        content = Path(inp["file_path"]).read_text()
+        content = _tool_path(inp).read_text()
         lines = content.split("\n")
         numbered = "\n".join(f"{i+1:4d} | {line}" for i, line in enumerate(lines))
         return numbered
@@ -265,7 +630,7 @@ def _read_file(inp: dict) -> str:
 
 def _write_file(inp: dict) -> str:
     try:
-        path = Path(inp["file_path"])
+        path = _tool_path(inp)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(inp["content"])
         _auto_update_memory_index(str(path))
@@ -340,7 +705,7 @@ def _generate_diff(old_content: str, old_string: str, new_string: str) -> str:
 
 def _edit_file(inp: dict) -> str:
     try:
-        path = Path(inp["file_path"])
+        path = _tool_path(inp)
         content = path.read_text()
 
         actual = _find_actual_string(content, inp["old_string"])
@@ -364,6 +729,8 @@ def _edit_file(inp: dict) -> str:
 def _list_files(inp: dict) -> str:
     try:
         base = Path(inp.get("path") or ".")
+        if not base.is_absolute() and inp.get("_cwd"):
+            base = Path(inp["_cwd"]) / base
         pattern = inp["pattern"]
         files = []
         for p in base.glob(pattern):
@@ -388,6 +755,8 @@ def _list_files(inp: dict) -> str:
 def _grep_search(inp: dict) -> str:
     pattern = inp["pattern"]
     path = inp.get("path") or "."
+    if inp.get("_cwd") and not Path(path).is_absolute():
+        path = str(Path(inp["_cwd"]) / path)
     include = inp.get("include")
 
     # Try system grep first (Linux/macOS)
@@ -456,23 +825,25 @@ def _grep_python(pattern: str, directory: str, include: str | None) -> str:
     return output
 
 
-def _run_shell_process(command: str, timeout_s: float) -> subprocess.CompletedProcess[str]:
+def _run_shell_process(command: str, timeout_s: float, cwd: str | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         command,
         shell=True,
         capture_output=True,
         text=True,
         timeout=timeout_s,
+        cwd=cwd,
     )
 
 
-def _run_shell_argv(argv: list[str], timeout_s: float) -> subprocess.CompletedProcess[str]:
+def _run_shell_argv(argv: list[str], timeout_s: float, cwd: str | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         argv,
         shell=False,
         capture_output=True,
         text=True,
         timeout=timeout_s,
+        cwd=cwd,
     )
 
 
@@ -622,8 +993,8 @@ def _should_use_sandbox(inp: dict, config: dict) -> tuple[bool, str]:
     return True, ""
 
 
-def _sandbox_profile(config: dict) -> str:
-    workspace = str(Path.cwd().resolve())
+def _sandbox_profile(config: dict, cwd: str | None = None) -> str:
+    workspace = str(Path(cwd).resolve()) if cwd else str(Path.cwd().resolve())
     temp_paths = {
         tempfile.gettempdir(),
         "/tmp",
@@ -676,7 +1047,7 @@ def _sandbox_shell() -> str:
     return shell
 
 
-def _run_sandboxed_shell(command: str, timeout_s: float, config: dict) -> str:
+def _run_sandboxed_shell(command: str, timeout_s: float, config: dict, cwd: str | None = None) -> str:
     sandbox_exec = shutil.which("sandbox-exec")
     if not sandbox_exec:
         if config["failIfUnavailable"]:
@@ -685,14 +1056,14 @@ def _run_sandboxed_shell(command: str, timeout_s: float, config: dict) -> str:
                 "unavailable",
                 "sandbox-exec not found",
             )
-        result = _run_shell_process(command, timeout_s)
+        result = _run_shell_process(command, timeout_s, cwd)
         return _with_sandbox_status(
             _format_shell_result(result),
             "fallback",
             "sandbox-exec not found; ran without sandbox",
         )
 
-    profile = _sandbox_profile(config)
+    profile = _sandbox_profile(config, cwd)
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".sb", delete=False) as profile_file:
         profile_file.write(profile)
         profile_path = profile_file.name
@@ -701,6 +1072,7 @@ def _run_sandboxed_shell(command: str, timeout_s: float, config: dict) -> str:
         result = _run_shell_argv(
             [sandbox_exec, "-f", profile_path, _sandbox_shell(), "-lc", command],
             timeout_s,
+            cwd,
         )
         if result.returncode == 71 and "sandbox_apply" in (result.stderr or ""):
             if config["failIfUnavailable"]:
@@ -709,7 +1081,7 @@ def _run_sandboxed_shell(command: str, timeout_s: float, config: dict) -> str:
                     "unavailable",
                     "sandbox-exec failed to start",
                 )
-            fallback_result = _run_shell_process(command, timeout_s)
+            fallback_result = _run_shell_process(command, timeout_s, cwd)
             return _with_sandbox_status(
                 _format_shell_result(fallback_result),
                 "fallback",
@@ -727,11 +1099,12 @@ def _run_shell(inp: dict) -> str:
     try:
         timeout_ms = inp.get("timeout", 30000)
         timeout_s = timeout_ms / 1000
+        cwd = inp.get("_cwd")
         config = _sandbox_config()
         use_sandbox, reason = _should_use_sandbox(inp, config)
         if use_sandbox:
-            return _run_sandboxed_shell(inp["command"], timeout_s, config)
-        result = _format_shell_result(_run_shell_process(inp["command"], timeout_s))
+            return _run_sandboxed_shell(inp["command"], timeout_s, config, cwd)
+        result = _format_shell_result(_run_shell_process(inp["command"], timeout_s, cwd))
         return _with_sandbox_status(result, "unsandboxed", reason)
     except subprocess.TimeoutExpired:
         return f"Command timed out after {inp.get('timeout', 30000)}ms"
@@ -892,7 +1265,12 @@ def check_permission(
     if rule_result == "allow":
         return {"action": "allow"}
 
-    if tool_name in READ_TOOLS or tool_name in ORCHESTRATION_TOOLS:
+    if mode == "plan" and tool_name in WORKTREE_TOOLS and tool_name not in {"worktree_status", "worktree_diff"}:
+        return {"action": "deny", "message": f"Blocked in plan mode: {tool_name}"}
+
+    if tool_name in READ_TOOLS or tool_name in TODO_TOOLS or tool_name in MCP_RUNTIME_TOOLS or (
+        tool_name in ORCHESTRATION_TOOLS and tool_name not in WORKTREE_CONFIRM_TOOLS
+    ) or tool_name in TEAM_MEMBER_TOOLS:
         return {"action": "allow"}
 
     if mode == "plan":
@@ -925,6 +1303,9 @@ def check_permission(
     elif tool_name == "edit_file" and not Path(inp.get("file_path", "")).exists():
         needs_confirm = True
         confirm_message = f"edit non-existent file: {inp.get('file_path', '')}"
+    elif tool_name in WORKTREE_CONFIRM_TOOLS:
+        needs_confirm = True
+        confirm_message = f"{tool_name}: {inp.get('agent', '')}"
 
     if needs_confirm:
         if mode == "dontAsk":
@@ -955,13 +1336,18 @@ def _truncate_result(result: str) -> str:
 
 
 async def execute_tool(
-    name: str, inp: dict, read_file_state: dict[str, float] | None = None
+    name: str,
+    inp: dict,
+    read_file_state: dict[str, float] | None = None,
+    cwd: str | None = None,
 ) -> str:
+    if cwd:
+        inp = {**inp, "_cwd": cwd}
     # ─── read-before-edit + mtime freshness checks ───────────
     if name == "read_file":
         result = _read_file(inp)
         if read_file_state is not None and not result.startswith("Error"):
-            abs_path = str(Path(inp["file_path"]).resolve())
+            abs_path = str(_tool_path(inp).resolve())
             try:
                 read_file_state[abs_path] = os.path.getmtime(abs_path)
             except OSError:
@@ -969,7 +1355,7 @@ async def execute_tool(
         return _truncate_result(result)
 
     if name in ("write_file", "edit_file") and read_file_state is not None:
-        abs_path = str(Path(inp["file_path"]).resolve())
+        abs_path = str(_tool_path(inp).resolve())
         if os.path.exists(abs_path):
             if abs_path not in read_file_state:
                 verb = "writing" if name == "write_file" else "editing"
@@ -1010,7 +1396,7 @@ async def execute_tool(
 
     # Update mtime after successful write/edit
     if name in ("write_file", "edit_file") and read_file_state is not None and not result.startswith("Error"):
-        abs_path = str(Path(inp["file_path"]).resolve())
+        abs_path = str(_tool_path(inp).resolve())
         try:
             read_file_state[abs_path] = os.path.getmtime(abs_path)
         except OSError:

@@ -17,7 +17,7 @@ console = Console(highlight=False)
 def print_welcome() -> None:
     console.print("\n  [bold cyan]ForgeCC[/bold cyan][dim] — A learning-oriented coding agent[/dim]\n")
     console.print("[dim]  Type your request, or 'exit' to quit.[/dim]")
-    console.print("[dim]  Commands: /clear /plan /cost /compact /tasks /memory /skills[/dim]\n")
+    console.print("[dim]  Commands: /clear /plan /cost /compact /todos /tasks /teams /memory /skills[/dim]\n")
 
 
 def print_user_prompt() -> None:
@@ -182,10 +182,30 @@ _TOOL_ICONS = {
     "grep_search": "🔍",
     "run_shell": "💻",
     "skill": "⚡",
+    "todo_write": "☑",
     "agent": "🤖",
     "task_status": "📋",
     "task_output": "📄",
     "task_stop": "⏹",
+    "team_create": "👥",
+    "team_status": "👥",
+    "team_add_task": "🧾",
+    "team_message": "✉️",
+    "team_wake": "⏰",
+    "team_stop": "⏹",
+    "team_compact": "🧹",
+    "team_read_board": "📋",
+    "team_read_messages": "✉️",
+    "team_claim_task": "🧾",
+    "team_update_task": "📝",
+    "team_send_message": "✉️",
+    "team_idle": "💤",
+    "worktree_create": "🌿",
+    "worktree_status": "🌿",
+    "worktree_diff": "🌿",
+    "worktree_commit": "🌿",
+    "worktree_merge": "🌿",
+    "worktree_cleanup": "🌿",
 }
 
 
@@ -214,4 +234,8 @@ def _get_tool_summary(name: str, inp: dict) -> str:
         return f'[{inp.get("type", "general")}{bg}] {inp.get("description", "")}'
     if name in ("task_status", "task_output", "task_stop"):
         return inp.get("task_id", "all")
+    if name.startswith("team_"):
+        return inp.get("team_id") or inp.get("name") or inp.get("task_id") or inp.get("to", "")
+    if name.startswith("worktree_"):
+        return inp.get("agent", "")
     return ""

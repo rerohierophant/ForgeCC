@@ -142,6 +142,12 @@ async def run_repl(agent: Agent) -> None:
         if inp == "/tasks":
             agent.show_tasks()
             continue
+        if inp == "/teams":
+            agent.show_teams()
+            continue
+        if inp == "/todos":
+            agent.show_todos()
+            continue
         if inp == "/memory":
             memories = list_memories()
             if not memories:
@@ -216,7 +222,9 @@ REPL commands:
   /plan               Toggle plan mode (read-only <-> normal)
   /cost               Show token usage and cost
   /compact            Manually compact conversation
+  /todos              Show current session todo list
   /tasks              List background sub-agent tasks
+  /teams              List persistent agent teams
   /memory             List saved memories
   /skills             List available skills
   /<skill-name>       Invoke a skill (e.g. /commit "fix types")
@@ -266,6 +274,7 @@ Examples:
             if session:
                 agent.restore_session({
                     "openaiMessages": session.get("openaiMessages"),
+                    "todos": session.get("todos"),
                 })
             else:
                 print_info("No session found to resume.")

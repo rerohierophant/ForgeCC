@@ -34,6 +34,7 @@ class McpConnection:
         self._next_id = 1
         self._pending: dict[int, asyncio.Future] = {}
         self._reader_task: asyncio.Task | None = None
+        self._events: list[dict] = []
 
     async def connect(self) -> None:
         """Spawn the server process."""
@@ -69,6 +70,12 @@ class McpConnection:
                     )
                 else:
                     fut.set_result(msg.get("result"))
+            elif msg.get("method"):
+                self._events.append({
+                    "server": self.server_name,
+                    "method": msg.get("method"),
+                    "params": msg.get("params") or {},
+                })
 
     async def _send_request(self, method: str, params: dict | None = None) -> Any:
         """Send a JSON-RPC request and wait for response."""
@@ -94,7 +101,9 @@ class McpConnection:
         """Perform MCP initialize handshake."""
         await self._send_request("initialize", {
             "protocolVersion": "2024-11-05",
-            "capabilities": {},
+            "capabilities": {
+                "resources": {"subscribe": True},
+            },
             "clientInfo": {"name": "forgecc", "version": "1.0.0"},
         })
         self._send_notification("notifications/initialized")
@@ -122,6 +131,44 @@ class McpConnection:
                 c["text"] for c in result["content"] if c.get("type") == "text"
             )
         return json.dumps(result)
+
+    async def list_resources(self) -> list[dict]:
+        result = await self._send_request("resources/list")
+        resources = result.get("resources", []) if isinstance(result, dict) else []
+        if not isinstance(resources, list):
+            return []
+        return resources
+
+    async def read_resource(self, uri: str) -> str:
+        result = await self._send_request("resources/read", {"uri": uri})
+        if not isinstance(result, dict):
+            return json.dumps(result)
+        contents = result.get("contents")
+        if not isinstance(contents, list):
+            return json.dumps(result)
+        parts: list[str] = []
+        for item in contents:
+            if not isinstance(item, dict):
+                continue
+            label = item.get("uri") or uri
+            if "text" in item:
+                parts.append(f"Resource: {label}\n{item['text']}")
+            elif "blob" in item:
+                parts.append(f"Resource: {label}\n[blob content omitted]")
+        return "\n\n".join(parts) or json.dumps(result)
+
+    async def subscribe_resource(self, uri: str) -> str:
+        result = await self._send_request("resources/subscribe", {"uri": uri})
+        return json.dumps(result or {"subscribed": uri})
+
+    async def unsubscribe_resource(self, uri: str) -> str:
+        result = await self._send_request("resources/unsubscribe", {"uri": uri})
+        return json.dumps(result or {"unsubscribed": uri})
+
+    def poll_events(self, max_events: int = 20) -> list[dict]:
+        events = self._events[:max_events]
+        del self._events[:max_events]
+        return events
 
     def close(self) -> None:
         """Kill the server process."""
@@ -151,6 +198,7 @@ class McpManager:
     def __init__(self):
         self._connections: dict[str, McpConnection] = {}
         self._tools: list[dict] = []
+        self._configs: dict[str, dict] = {}
         self._connected = False
 
     async def load_and_connect(self) -> None:
@@ -160,6 +208,7 @@ class McpManager:
         self._connected = True
 
         configs = self._load_configs()
+        self._configs = configs
         if not configs:
             return
 
@@ -209,6 +258,115 @@ class McpManager:
         if not conn:
             raise RuntimeError(f"MCP server '{server_name}' not connected")
         return await conn.call_tool(tool_name, args)
+
+    async def call_runtime_tool(self, name: str, inp: dict) -> str:
+        server = inp.get("server")
+        if name == "mcp_list_resources":
+            return await self._list_resources(server)
+        if name == "mcp_read_resource":
+            return await self._read_resource(inp.get("server") or "", inp.get("uri") or "")
+        if name == "mcp_subscribe_resource":
+            return await self._subscribe_resource(inp.get("server") or "", inp.get("uri") or "")
+        if name == "mcp_unsubscribe_resource":
+            return await self._unsubscribe_resource(inp.get("server") or "", inp.get("uri") or "")
+        if name == "mcp_poll":
+            return self._poll(server, int(inp.get("max_events") or 20))
+        if name == "mcp_oauth_status":
+            return self._oauth_status(server)
+        return f"Unknown MCP runtime tool: {name}"
+
+    async def _list_resources(self, server: str | None = None) -> str:
+        conns = self._select_connections(server)
+        if not conns:
+            return "No connected MCP servers."
+        lines: list[str] = []
+        for name, conn in conns.items():
+            try:
+                resources = await conn.list_resources()
+            except Exception as exc:
+                lines.append(f"{name}: resource listing failed: {exc}")
+                continue
+            if not resources:
+                lines.append(f"{name}: no resources")
+                continue
+            lines.append(f"{name}:")
+            for res in resources:
+                uri = res.get("uri", "")
+                title = res.get("name") or res.get("title") or uri
+                mime = f" ({res.get('mimeType')})" if res.get("mimeType") else ""
+                lines.append(f"- {uri}{mime} — {title}")
+        return "\n".join(lines)
+
+    async def _read_resource(self, server: str, uri: str) -> str:
+        conn = self._connections.get(server)
+        if not conn:
+            return f"MCP server '{server}' not connected"
+        if not uri:
+            return "Error: uri is required."
+        return await conn.read_resource(uri)
+
+    async def _subscribe_resource(self, server: str, uri: str) -> str:
+        conn = self._connections.get(server)
+        if not conn:
+            return f"MCP server '{server}' not connected"
+        if not uri:
+            return "Error: uri is required."
+        try:
+            return await conn.subscribe_resource(uri)
+        except Exception as exc:
+            return f"Subscription failed: {exc}"
+
+    async def _unsubscribe_resource(self, server: str, uri: str) -> str:
+        conn = self._connections.get(server)
+        if not conn:
+            return f"MCP server '{server}' not connected"
+        if not uri:
+            return "Error: uri is required."
+        try:
+            return await conn.unsubscribe_resource(uri)
+        except Exception as exc:
+            return f"Unsubscribe failed: {exc}"
+
+    def _poll(self, server: str | None, max_events: int) -> str:
+        conns = self._select_connections(server)
+        events: list[dict] = []
+        for conn in conns.values():
+            events.extend(conn.poll_events(max_events=max(0, max_events - len(events))))
+            if len(events) >= max_events:
+                break
+        if not events:
+            return "No MCP events."
+        return json.dumps(events, indent=2)
+
+    def _oauth_status(self, server: str | None = None) -> str:
+        names = [server] if server else sorted(self._configs)
+        if not names:
+            return "No MCP servers configured."
+        lines: list[str] = []
+        for name in names:
+            cfg = self._configs.get(name)
+            if not cfg:
+                lines.append(f"{name}: not configured")
+                continue
+            oauth = cfg.get("oauth") or cfg.get("authorization") or {}
+            env = cfg.get("env") or {}
+            token_vars = []
+            for key, value in env.items():
+                if "TOKEN" in key.upper() or "API_KEY" in key.upper():
+                    token_vars.append((key, bool(os.environ.get(key) or value)))
+            if not oauth and not token_vars:
+                lines.append(f"{name}: no OAuth/token metadata configured")
+                continue
+            oauth_bits = ", ".join(f"{k}={v}" for k, v in oauth.items()) if isinstance(oauth, dict) else str(oauth)
+            token_bits = ", ".join(f"{key}:{'set' if present else 'missing'}" for key, present in token_vars)
+            lines.append(f"{name}: oauth={oauth_bits or '(none)'} tokens={token_bits or '(none)'}")
+        return "\n".join(lines)
+
+    def _select_connections(self, server: str | None) -> dict[str, McpConnection]:
+        if server:
+            conn = self._connections.get(server)
+            return {server: conn} if conn else {}
+        return self._connections
 
     async def disconnect_all(self) -> None:
         """Disconnect all servers."""

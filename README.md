@@ -2,30 +2,34 @@
 
 ForgeCC 是一个基于 Python 的 coding agent 学习项目，参考 `claude-code-from-scratch` 的实现思路整理而来。当前根目录只保留一份 Python 实现，CLI 入口为 `cca`。
 
-这个项目的重点不是做一个生产级 Agent，而是把 coding agent 的核心结构摊开：消息循环、工具调用、权限确认、上下文压缩、会话保存、记忆、skills、Plan Mode、Sub-Agent 和 MCP 集成。
+这个项目的重点不是做一个生产级 Agent，而是把 coding agent 的核心结构摊开：消息循环、工具调用、权限确认、上下文压缩、会话保存、记忆、skills、Plan Mode、Sub-Agent、Coordinator/Swarm multi-agent 编排和 MCP 集成。
 
 ## 功能
 
 - CLI：一次性 prompt 和交互式 REPL
 - OpenAI-compatible `/chat/completions` 后端
-- 工具系统：文件读写、精确编辑、列表、搜索、shell、web_fetch、skill、sub-agent、plan mode、tool_search
+- 工具系统：文件读写、精确编辑、列表、搜索、shell、web_fetch、todo_write、skill、sub-agent、plan mode、tool_search
 - 权限模式：默认确认、只读计划、自动批准编辑、跳过确认、自动拒绝
 - 上下文管理：大输出裁剪、microcompact、自动 compact、预算和轮次限制
 - 会话持久化：`--resume` 恢复最近会话
 - 记忆系统：按项目保存记忆并注入 prompt
 - Skills：从 `.claude/skills/<name>/SKILL.md` 发现可复用指令
-- MCP：从 `.claude/settings.json` 或 `~/.claude/settings.json` 加载外部工具服务器
+- Coordinator：支持显式 `--coordinator` 或模型通过 `enter_coordinator_mode` 自主切换，将任务拆给后台 sub-agent 并汇总结果
+- Swarm Team：持久化 agent team、共享任务板、固定消息协议、mailbox、idle/wake loop、自主 claim/update task
+- Worktree backend：写入型 team member 可在独立 git worktree 中修改代码，主 Agent review diff 后再 commit/merge
+- MCP：从 `.claude/settings.json` 或 `~/.claude/settings.json` 加载外部工具服务器，支持 tools、resources、subscriptions、polling 和 OAuth/token 状态检查
 - Hooks：从 `.claude/settings.json` 或 `~/.claude/settings.json` 加载安全/权限 hook
 
 ## 安装
 
 目标环境：
 
-- Windows
+- macOS
+- Shell：zsh
 - Conda 环境：`cc`
 - Python 3.11+
 
-```powershell
+```bash
 conda activate cc
 pip install -e .
 ```
@@ -34,21 +38,21 @@ pip install -e .
 
 OpenAI-compatible 后端：
 
-```powershell
-$env:OPENAI_API_KEY="your-key"
-$env:OPENAI_BASE_URL="https://api.openai.com/v1"
-$env:OPENAI_MODEL="gpt-4.1-mini"
+```bash
+export OPENAI_API_KEY="your-key"
+export OPENAI_BASE_URL="https://api.openai.com/v1"
+export OPENAI_MODEL="gpt-4.1-mini"
 ```
 
 使用官方 OpenAI API 时，ForgeCC 会发送稳定的 prompt cache key，并在 `/cost` 中显示 cached input tokens。ForgeCC 默认不主动设置 retention；如需请求 24h retention，可设置：
 
-```powershell
-$env:CCA_PROMPT_CACHE_RETENTION="24h"
+```bash
+export CCA_PROMPT_CACHE_RETENTION="24h"
 ```
 
 CLI 参数可以覆盖模型和 API 地址：
 
-```powershell
+```bash
 cca --model gpt-4.1-mini --api-base https://api.openai.com/v1 "hello"
 ```
 
@@ -56,23 +60,24 @@ cca --model gpt-4.1-mini --api-base https://api.openai.com/v1 "hello"
 
 一次性运行：
 
-```powershell
+```bash
 cca "解释这个项目的 agent loop"
 ```
 
 进入交互式 REPL：
 
-```powershell
+```bash
 cca
 ```
 
 常用选项：
 
-```powershell
+```bash
 cca --plan "先分析如何重构工具系统"
 cca --accept-edits "修复测试失败"
 cca --yolo "运行测试并修复问题"
 cca --dont-ask "只做静态检查"
+cca --coordinator "让多个 agent 并行审查这个仓库"
 cca --resume
 cca --max-cost 0.50 --max-turns 20 "实现一个小功能"
 ```
@@ -84,12 +89,59 @@ REPL 内置命令：
 /plan       切换只读计划模式
 /cost       查看 token 和估算成本
 /compact    手动压缩上下文
+/todos      查看当前会话 todo_write 清单
+/tasks      查看后台 sub-agent 任务
+/teams      查看持久化 agent team
 /memory     列出记忆
 /skills     列出 skills
 exit        退出
 ```
 
-会话保存在 `~/.forgecc/sessions`，工具大结果和记忆也保存在 `~/.forgecc` 下。
+会话保存在 `~/.forgecc/sessions`，工具大结果和记忆也保存在 `~/.forgecc` 下。项目级 team/worktree 状态保存在当前仓库的 `.forgecc/teams` 和 `.forgecc/worktrees` 下，便于 agent team 与 git worktree 后端围绕当前项目工作。
+
+## Multi-agent
+
+ForgeCC 当前包含三层 multi-agent 能力：
+
+- Sub-Agent fork-return：`agent` 工具启动独立上下文完成搜索、分析、计划或一般任务，结果返回主会话。
+- Coordinator：主 Agent 进入编排模式后，只保留 orchestration 工具，负责拆分任务、启动后台 sub-agent、查看 `task_status` / `task_output` 并汇总结果。
+- Swarm Team：`team_create` 创建持久化 team，成员通过共享 task board 和 mailbox 协作，可自主 `team_claim_task`、`team_update_task`、`team_send_message`、`team_idle`。
+
+Team mailbox 使用固定消息协议：
+
+```text
+REQUEST  请求某个 agent 或全体执行/协助一项工作
+REPLY    回复某条消息，必须带 thread_id
+STATUS   报告进度或完成情况
+BLOCKED  报告阻塞和原因
+```
+
+写入型 team member 可设置 `worktree=true`，ForgeCC 会为其创建独立 git worktree。常用 review / integration 工具：
+
+```text
+worktree_status
+worktree_diff
+worktree_commit
+worktree_merge
+worktree_cleanup
+```
+
+`worktree_commit`、`worktree_merge`、`worktree_cleanup` 在普通权限模式下会触发确认；Plan Mode 下只允许查看 status/diff。
+
+## MCP Runtime
+
+MCP 配置仍从 `.claude/settings.json`、`~/.claude/settings.json` 或 `.mcp.json` 读取。除了把 MCP server tools 暴露为 `mcp__server__tool`，ForgeCC 还支持：
+
+```text
+mcp_list_resources
+mcp_read_resource
+mcp_subscribe_resource
+mcp_unsubscribe_resource
+mcp_poll
+mcp_oauth_status
+```
+
+其中 `mcp_oauth_status` 只检查配置和 token/env 状态；CLI 当前不执行浏览器式 OAuth 授权流。
 
 ## 安全 Hooks
 
@@ -161,6 +213,9 @@ src/mini_coding_agent/
   memory.py        项目记忆
   skills.py        skills 发现和解析
   subagent.py      子 Agent 配置
+  tasks.py         后台 sub-agent task runtime
+  teams.py         Swarm team、task board、mailbox、idle/wake runtime
+  worktrees.py     Git worktree 隔离写入 backend
   mcp_client.py    MCP JSON-RPC over stdio 客户端
   hooks.py         安全/权限 hook 加载和执行
   ui.py            终端输出
@@ -170,7 +225,7 @@ src/mini_coding_agent/
 
 ## 验证
 
-```powershell
+```bash
 conda run -n cc python -m compileall src
 conda run -n cc cca --help
 ```
