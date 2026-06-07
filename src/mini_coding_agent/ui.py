@@ -7,6 +7,7 @@ import threading
 import time
 
 from rich.console import Console
+from rich.markup import escape
 
 console = Console(highlight=False)
 
@@ -16,7 +17,7 @@ console = Console(highlight=False)
 def print_welcome() -> None:
     console.print("\n  [bold cyan]ForgeCC[/bold cyan][dim] — A learning-oriented coding agent[/dim]\n")
     console.print("[dim]  Type your request, or 'exit' to quit.[/dim]")
-    console.print("[dim]  Commands: /clear /plan /cost /compact /memory /skills[/dim]\n")
+    console.print("[dim]  Commands: /clear /plan /cost /compact /tasks /memory /skills[/dim]\n")
 
 
 def print_user_prompt() -> None:
@@ -30,7 +31,7 @@ def print_assistant_text(text: str) -> None:
 
 def print_tool_call(name: str, inp: dict) -> None:
     icon = _get_tool_icon(name)
-    summary = _get_tool_summary(name, inp)
+    summary = escape(_get_tool_summary(name, inp))
     console.print(f"\n  [yellow]{icon} {name}[/yellow][dim] {summary}[/dim]")
 
 
@@ -42,7 +43,7 @@ def print_tool_result(name: str, result: str) -> None:
     truncated = result
     if len(result) > max_len:
         truncated = result[:max_len] + f"\n  ... ({len(result)} chars total)"
-    lines = "\n".join("  " + l for l in truncated.split("\n"))
+    lines = "\n".join("  " + escape(l) for l in truncated.split("\n"))
     console.print(f"[dim]{lines}[/dim]")
 
 
@@ -70,7 +71,7 @@ def _print_file_change_result(_name: str, result: str) -> None:
 
 
 def print_error(msg: str) -> None:
-    console.print(f"\n  [red]Error: {msg}[/red]")
+    console.print(f"\n  [red]Error: {escape(msg)}[/red]")
 
 
 def print_confirmation(command: str) -> None:
@@ -96,7 +97,7 @@ def print_retry(attempt: int, max_retries: int, reason: str) -> None:
 
 
 def print_info(msg: str) -> None:
-    console.print(f"\n  [cyan]ℹ {msg}[/cyan]")
+    console.print(f"\n  [cyan]ℹ {escape(msg)}[/cyan]")
 
 
 # ─── Spinner ──────────────────────────────────────────────
@@ -164,11 +165,11 @@ def print_plan_approval_options() -> None:
 
 
 def print_sub_agent_start(agent_type: str, description: str) -> None:
-    console.print(f"\n  [magenta]┌─ Sub-agent [{agent_type}]: {description}[/magenta]")
+    console.print(f"\n  ┌─ Sub-agent [{agent_type}]: {description}", style="magenta", markup=False)
 
 
 def print_sub_agent_end(agent_type: str, _description: str) -> None:
-    console.print(f"  [magenta]└─ Sub-agent [{agent_type}] completed[/magenta]")
+    console.print(f"  └─ Sub-agent [{agent_type}] completed", style="magenta", markup=False)
 
 
 # ─── Tool icons and summaries ───────────────────────────────
@@ -182,6 +183,9 @@ _TOOL_ICONS = {
     "run_shell": "💻",
     "skill": "⚡",
     "agent": "🤖",
+    "task_status": "📋",
+    "task_output": "📄",
+    "task_stop": "⏹",
 }
 
 
@@ -206,5 +210,8 @@ def _get_tool_summary(name: str, inp: dict) -> str:
     if name == "skill":
         return inp.get("skill_name", "")
     if name == "agent":
-        return f'[{inp.get("type", "general")}] {inp.get("description", "")}'
+        bg = " background" if inp.get("background") else ""
+        return f'[{inp.get("type", "general")}{bg}] {inp.get("description", "")}'
+    if name in ("task_status", "task_output", "task_stop"):
+        return inp.get("task_id", "all")
     return ""

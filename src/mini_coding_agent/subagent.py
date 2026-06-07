@@ -7,7 +7,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .frontmatter import parse_frontmatter
-from .tools import tool_definitions, ToolDef
+from .tools import tool_definitions, ToolDef, ORCHESTRATION_TOOLS
 
 # ─── Read-only tools (for explore and plan agents) ──────────
 
@@ -127,7 +127,7 @@ def get_sub_agent_config(agent_type: str) -> dict:
         if custom["allowed_tools"]:
             tools = [t for t in tool_definitions if t["name"] in custom["allowed_tools"]]
         else:
-            tools = [t for t in tool_definitions if t["name"] != "agent"]
+            tools = [t for t in tool_definitions if t["name"] not in ORCHESTRATION_TOOLS]
         return {"system_prompt": custom["system_prompt"], "tools": tools}
 
     read_only = [t for t in tool_definitions if t["name"] in READ_ONLY_TOOLS]
@@ -137,7 +137,7 @@ def get_sub_agent_config(agent_type: str) -> dict:
     elif agent_type == "plan":
         return {"system_prompt": PLAN_PROMPT, "tools": read_only}
     else:  # general
-        return {"system_prompt": GENERAL_PROMPT, "tools": [t for t in tool_definitions if t["name"] != "agent"]}
+        return {"system_prompt": GENERAL_PROMPT, "tools": [t for t in tool_definitions if t["name"] not in ORCHESTRATION_TOOLS]}
 
 
 # ─── Available agent types (for system prompt) ──────────────

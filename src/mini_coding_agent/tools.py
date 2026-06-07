@@ -1,6 +1,6 @@
-"""Tool definitions and execution — 10 tools with 5 permission modes.
+"""Tool definitions and execution — tools with 5 permission modes.
 Mirrors Claude Code's tool system: read_file, write_file, edit_file, list_files,
-grep_search, run_shell, skill, enter/exit_plan_mode, agent."""
+grep_search, run_shell, skill, enter/exit_plan_mode, agent, task tools."""
 
 from __future__ import annotations
 
@@ -24,6 +24,8 @@ PermissionMode = str  # "default" | "plan" | "acceptEdits" | "bypassPermissions"
 
 READ_TOOLS = {"read_file", "list_files", "grep_search", "web_fetch"}
 EDIT_TOOLS = {"write_file", "edit_file"}
+TASK_TOOLS = {"task_status", "task_output", "task_stop"}
+ORCHESTRATION_TOOLS = {"agent", *TASK_TOOLS}
 
 # Concurrency-safe tools can run in parallel (read-only, no side effects)
 CONCURRENCY_SAFE_TOOLS = {"read_file", "list_files", "grep_search", "web_fetch"}
@@ -151,6 +153,18 @@ tool_definitions: list[ToolDef] = [
         "deferred": True,
     },
     {
+        "name": "enter_coordinator_mode",
+        "description": "Switch to coordinator mode for tasks that clearly benefit from multiple background sub-agents, such as parallel code review, competing-hypothesis debugging, cross-module research, or broad codebase exploration.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reason": {"type": "string", "description": "Why this task benefits from coordinator mode instead of normal single-agent execution."},
+            },
+            "required": ["reason"],
+        },
+        "deferred": True,
+    },
+    {
         "name": "agent",
         "description": "Launch a sub-agent to handle a task autonomously. Sub-agents have isolated context and return their result. Types: 'explore' (read-only), 'plan' (read-only, structured planning), 'general' (full tools).",
         "input_schema": {
@@ -159,8 +173,41 @@ tool_definitions: list[ToolDef] = [
                 "description": {"type": "string", "description": "Short (3-5 word) description of the sub-agent's task"},
                 "prompt": {"type": "string", "description": "Detailed task instructions for the sub-agent"},
                 "type": {"type": "string", "enum": ["explore", "plan", "general"], "description": "Agent type. Default: general"},
+                "background": {"type": "boolean", "description": "If true, start the sub-agent as a background task and return a task_id immediately."},
             },
             "required": ["description", "prompt"],
+        },
+    },
+    {
+        "name": "task_status",
+        "description": "Show status for background sub-agent tasks. Omit task_id to list all tasks.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "Optional task id to inspect"},
+            },
+        },
+    },
+    {
+        "name": "task_output",
+        "description": "Read the output of a completed background sub-agent task. If still running, returns its current status.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "Task id returned by the agent tool"},
+            },
+            "required": ["task_id"],
+        },
+    },
+    {
+        "name": "task_stop",
+        "description": "Request cancellation of a running background sub-agent task.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "Task id returned by the agent tool"},
+            },
+            "required": ["task_id"],
         },
     },
     # ─── Tool search (deferred tool loader) ─────────────────────
@@ -845,7 +892,7 @@ def check_permission(
     if rule_result == "allow":
         return {"action": "allow"}
 
-    if tool_name in READ_TOOLS:
+    if tool_name in READ_TOOLS or tool_name in ORCHESTRATION_TOOLS:
         return {"action": "allow"}
 
     if mode == "plan":

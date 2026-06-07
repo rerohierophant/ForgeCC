@@ -22,6 +22,8 @@ from .tools import (
     execute_tool,
     check_permission,
     CONCURRENCY_SAFE_TOOLS,
+    ORCHESTRATION_TOOLS,
+    TASK_TOOLS,
     get_active_tool_definitions,
     ToolDef,
 )
@@ -50,6 +52,7 @@ from .prompt import build_system_prompt
 from .subagent import get_sub_agent_config
 from .mcp_client import McpManager
 from .hooks import run_hooks
+from .tasks import TaskManager
 
 # ─── Retry with exponential backoff ──────────────────────────
 
@@ -163,13 +166,20 @@ class Agent:
         custom_system_prompt: str | None = None,
         custom_tools: list[ToolDef] | None = None,
         is_sub_agent: bool = False,
+        coordinator_mode: bool = False,
     ):
         self.permission_mode = permission_mode
         self.model = model
         self.api_base = api_base
         self.api_key = api_key
         self.is_sub_agent = is_sub_agent
-        self.tools = custom_tools or tool_definitions
+        self.coordinator_mode = coordinator_mode
+        if custom_tools is not None:
+            self.tools = custom_tools
+        elif coordinator_mode:
+            self.tools = [t for t in tool_definitions if t["name"] in ORCHESTRATION_TOOLS]
+        else:
+            self.tools = tool_definitions
         self.max_cost_usd = max_cost_usd
         self.max_turns = max_turns
         self.confirm_fn = confirm_fn
@@ -202,6 +212,9 @@ class Agent:
         # Output buffer (sub-agents capture output)
         self._output_buffer: list[str] | None = None
 
+        # Background sub-agent tasks for coordinator-style multi-agent work
+        self._task_manager = TaskManager()
+
         # Read-before-edit: track file read timestamps (absolutePath → mtime)
         self._read_file_state: dict[str, float] = {}
 
@@ -217,6 +230,8 @@ class Agent:
 
         # Build system prompt
         self._base_system_prompt = custom_system_prompt or build_system_prompt()
+        if self.coordinator_mode:
+            self._base_system_prompt += self._build_coordinator_prompt()
         if self.permission_mode == "plan":
             self._plan_file_path = self._generate_plan_file_path()
             self._system_prompt = self._base_system_prompt + self._build_plan_mode_prompt()
@@ -299,7 +314,7 @@ class Agent:
         user_message = prompt_hook["prompt"]
 
         # MCP在第一次真正聊天时才懒加载 (只有main agent加载MCP，避免重复加载)
-        if not self._mcp_initialized and not self.is_sub_agent:
+        if not self._mcp_initialized and not self.is_sub_agent and not self.coordinator_mode:
             self._mcp_initialized = True
             try:
                 await self._mcp_manager.load_and_connect()
@@ -392,6 +407,10 @@ class Agent:
         turn_info = f" | Turns: {self.current_turns}/{self.max_turns}" if self.max_turns else ""
         cache_info = f" ({self.total_cached_input_tokens} cached)" if self.total_cached_input_tokens else ""
         print_info(f"Tokens: {self.total_input_tokens} in{cache_info} / {self.total_output_tokens} out\n  Estimated cost: ${total:.4f}{budget_info}{turn_info}")
+
+    def show_tasks(self) -> None:
+        self._sync_task_usage()
+        print_info(self._task_manager.format_status())
 
     def _get_current_cost_usd(self) -> float:
         uncached_input = max(0, self.total_input_tokens - self.total_cached_input_tokens)
@@ -547,8 +566,12 @@ class Agent:
     async def _execute_tool_call(self, name: str, inp: dict) -> str:
         if name in ("enter_plan_mode", "exit_plan_mode"):
             return await self._execute_plan_mode_tool(name)
+        if name == "enter_coordinator_mode":
+            return self._execute_enter_coordinator_mode(inp)
         if name == "agent":
             return await self._execute_agent_tool(inp)
+        if name in TASK_TOOLS:
+            return self._execute_task_tool(name, inp)
         if name == "skill":
             return await self._execute_skill_tool(inp)
         # Route MCP tool calls to the MCP manager
@@ -687,7 +710,8 @@ class Agent:
                 custom_system_prompt=result["prompt"],
                 custom_tools=tools,
                 is_sub_agent=True,
-                permission_mode="plan" if self.permission_mode == "plan" else "bypassPermissions",
+                permission_mode=self.permission_mode,
+                confirm_fn=self.confirm_fn,
             )
             try:
                 sub_result = await sub_agent.run_once(inp.get("args") or "Execute this skill task.")
@@ -729,6 +753,53 @@ Write your plan incrementally to this file using write_file or edit_file. This i
 4. **Exit**: Call exit_plan_mode when your plan is ready for user review.
 
 IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask the user to approve — exit_plan_mode handles that."""
+
+    def _build_coordinator_prompt(self) -> str:
+        return """
+
+# Coordinator Mode Active
+
+You are running as a coordinator for multi-agent work. Your job is to decompose
+the user's request, launch focused sub-agents, monitor their progress, and
+synthesize their findings into one concise final answer.
+
+## Available actions
+- Use agent with background=true to start independent workers.
+- Use task_status to monitor all running workers.
+- Use task_output to read completed worker results.
+- Use task_stop only when a worker is clearly no longer useful.
+
+## Constraints
+- Do not try to edit files, read files, or run shell commands yourself.
+- Delegate codebase exploration, planning, implementation, and verification to
+  sub-agents.
+- Keep team sizes small. Prefer 2-4 workers unless the task clearly needs more.
+- Do not finish until all workers you spawned have completed, failed, or been
+  stopped and you have read their outputs.
+- Resolve conflicts between worker reports yourself and present the final
+  recommendation or result to the user.
+"""
+
+    def _execute_enter_coordinator_mode(self, inp: dict) -> str:
+        if self.coordinator_mode:
+            return "Already in coordinator mode."
+        self.coordinator_mode = True
+        self.tools = [t for t in tool_definitions if t["name"] in ORCHESTRATION_TOOLS]
+        self._base_system_prompt += self._build_coordinator_prompt()
+        self._system_prompt = self._base_system_prompt
+        if self.permission_mode == "plan":
+            self._system_prompt += self._build_plan_mode_prompt()
+        if self._openai_messages:
+            self._openai_messages[0]["content"] = self._system_prompt
+        reason = inp.get("reason") or "No reason provided."
+        print_info(f"Entered coordinator mode: {reason}")
+        return (
+            "Entered coordinator mode. You now have only orchestration tools: "
+            "agent, task_status, task_output, task_stop.\n"
+            f"Reason: {reason}\n\n"
+            "Decompose the task, launch background sub-agents where useful, "
+            "monitor them, read their outputs, and synthesize the final answer."
+        )
 
     async def _execute_plan_mode_tool(self, name: str) -> str:
         if name == "enter_plan_mode":
@@ -821,22 +892,32 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         agent_type = inp.get("type", "general")
         description = inp.get("description", "sub-agent task")
         prompt = inp.get("prompt", "")
+        background = bool(inp.get("background"))
 
         print_sub_agent_start(agent_type, description)
 
-        config = get_sub_agent_config(agent_type)
-        sub_agent = Agent(
-            model=self.model,
-            api_base=self.api_base,
-            api_key=self.api_key,
-            custom_system_prompt=config["system_prompt"],
-            custom_tools=config["tools"],
-            is_sub_agent=True,
-            permission_mode="plan" if self.permission_mode == "plan" else "bypassPermissions",
-        )
+        if background:
+            async def _runner() -> dict:
+                try:
+                    return await self._run_sub_agent_once(agent_type, prompt)
+                finally:
+                    print_sub_agent_end(agent_type, description)
+
+            record = self._task_manager.spawn(
+                description=description,
+                agent_type=agent_type,
+                prompt=prompt,
+                runner=_runner,
+            )
+            return (
+                f"Started background sub-agent task.\n"
+                f"task_id: {record.id}\n"
+                f"status: {record.status}\n"
+                f"Use task_status and task_output to monitor it."
+            )
 
         try:
-            result = await sub_agent.run_once(prompt)
+            result = await self._run_sub_agent_once(agent_type, prompt)
             self.total_input_tokens += result["tokens"]["input"]
             self.total_output_tokens += result["tokens"]["output"]
             self.total_cached_input_tokens += result["tokens"].get("cached_input", 0)
@@ -845,6 +926,44 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         except Exception as e:
             print_sub_agent_end(agent_type, description)
             return f"Sub-agent error: {e}"
+
+    async def _run_sub_agent_once(self, agent_type: str, prompt: str) -> dict:
+        config = get_sub_agent_config(agent_type)
+        sub_agent = Agent(
+            model=self.model,
+            api_base=self.api_base,
+            api_key=self.api_key,
+            custom_system_prompt=config["system_prompt"],
+            custom_tools=config["tools"],
+            is_sub_agent=True,
+            permission_mode=self.permission_mode,
+            confirm_fn=self.confirm_fn,
+        )
+        return await sub_agent.run_once(prompt)
+
+    def _execute_task_tool(self, name: str, inp: dict) -> str:
+        self._sync_task_usage()
+        task_id = inp.get("task_id")
+        if name == "task_status":
+            return self._task_manager.format_status(task_id)
+        if name == "task_output":
+            if not task_id:
+                return "Error: task_id is required."
+            return self._task_manager.format_output(task_id)
+        if name == "task_stop":
+            if not task_id:
+                return "Error: task_id is required."
+            if self._task_manager.stop(task_id):
+                return f"Stop requested for task {task_id}."
+            return f"Task {task_id} is not running or does not exist."
+        return f"Unknown task tool: {name}"
+
+    def _sync_task_usage(self) -> None:
+        for record in self._task_manager.unaccounted_completed():
+            self.total_input_tokens += record.tokens.get("input", 0)
+            self.total_output_tokens += record.tokens.get("output", 0)
+            self.total_cached_input_tokens += record.tokens.get("cached_input", 0)
+            record.token_accounted = True
 
     # ─── OpenAI-compatible backend ───────────────────────────────
 
@@ -914,6 +1033,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
             tool_calls = message.get("tool_calls")
             if not tool_calls:
+                self._sync_task_usage()
                 if not self.is_sub_agent:
                     print_cost(self.total_input_tokens, self.total_output_tokens, self.total_cached_input_tokens)
                 break

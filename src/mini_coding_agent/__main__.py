@@ -26,6 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plan", action="store_true", help="Plan mode: read-only")
     parser.add_argument("--accept-edits", action="store_true", help="Auto-approve file edits")
     parser.add_argument("--dont-ask", action="store_true", help="Auto-deny confirmations (for CI)")
+    parser.add_argument("--coordinator", action="store_true", help="Force coordinator mode: orchestrate background sub-agents")
     parser.add_argument("--model", "-m", default=None, help="Model to use")
     parser.add_argument("--api-base", default=None, help="OpenAI-compatible API base URL")
     parser.add_argument("--resume", action="store_true", help="Resume last session")
@@ -138,6 +139,9 @@ async def run_repl(agent: Agent) -> None:
             except Exception as e:
                 print_error(str(e))
             continue
+        if inp == "/tasks":
+            agent.show_tasks()
+            continue
         if inp == "/memory":
             memories = list_memories()
             if not memories:
@@ -199,6 +203,7 @@ Options:
   --plan              Plan mode: read-only, describe changes without executing
   --accept-edits      Auto-approve file edits, still confirm dangerous shell
   --dont-ask          Auto-deny anything needing confirmation (for CI)
+  --coordinator       Force coordinator mode: orchestrate background sub-agents
   --model, -m         Model to use (default: OPENAI_MODEL, CCA_MODEL, or gpt-4.1-mini)
   --api-base URL      Use OpenAI-compatible API endpoint (key via env var)
   --resume            Resume the last session
@@ -211,6 +216,7 @@ REPL commands:
   /plan               Toggle plan mode (read-only <-> normal)
   /cost               Show token usage and cost
   /compact            Manually compact conversation
+  /tasks              List background sub-agent tasks
   /memory             List saved memories
   /skills             List available skills
   /<skill-name>       Invoke a skill (e.g. /commit "fix types")
@@ -219,6 +225,7 @@ Examples:
   cca "fix the bug in src/app.py"
   cca --yolo "run all tests and fix failures"
   cca --plan "how would you refactor this?"
+  cca --coordinator "review this repo with separate security and test agents"
   cca --max-cost 0.50 --max-turns 20 "implement feature X"
   OPENAI_API_KEY=sk-xxx cca --api-base https://api.openai.com/v1 --model gpt-4.1-mini "hello"
   cca --resume
@@ -227,6 +234,7 @@ Examples:
         sys.exit(0)
 
     permission_mode = _resolve_permission_mode(args)
+    coordinator_mode = args.coordinator or os.environ.get("CCA_COORDINATOR_MODE", "").lower() in {"1", "true", "yes", "on"}
     model = args.model or os.environ.get("OPENAI_MODEL") or os.environ.get("CCA_MODEL") or "gpt-4.1-mini"
     api_base = args.api_base or os.environ.get("OPENAI_BASE_URL")
 
@@ -247,6 +255,7 @@ Examples:
         max_turns=args.max_turns,
         api_base=resolved_api_base,
         api_key=resolved_api_key,
+        coordinator_mode=coordinator_mode,
     )
 
     # Resume session
