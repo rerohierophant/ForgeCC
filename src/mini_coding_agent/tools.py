@@ -594,6 +594,8 @@ def get_active_tool_definitions(all_tools: list[ToolDef] | None = None) -> list[
     """Return tool definitions, excluding deferred tools that haven't been activated.
     Strips the 'deferred' key so it's not sent to the API."""
     tools = all_tools if all_tools is not None else tool_definitions
+    if os.environ.get("CCA_DISABLE_DEFERRED_TOOLS", "").lower() in {"1", "true", "yes", "on"}:
+        return [{k: v for k, v in t.items() if k != "deferred"} for t in tools]
     return [
         {k: v for k, v in t.items() if k != "deferred"}
         for t in tools
@@ -603,6 +605,8 @@ def get_active_tool_definitions(all_tools: list[ToolDef] | None = None) -> list[
 
 def get_deferred_tool_names(all_tools: list[ToolDef] | None = None) -> list[str]:
     """Return names of deferred tools that haven't been activated yet."""
+    if os.environ.get("CCA_DISABLE_DEFERRED_TOOLS", "").lower() in {"1", "true", "yes", "on"}:
+        return []
     tools = all_tools if all_tools is not None else tool_definitions
     return [t["name"] for t in tools if t.get("deferred") and t["name"] not in _activated_tools]
 
@@ -1150,11 +1154,35 @@ def _web_fetch(inp: dict) -> str:
 
 DANGEROUS_PATTERNS = [
     re.compile(r"\brm\s"),
-    re.compile(r"\bgit\s+(push|reset|clean|checkout\s+\.)"),
+    re.compile(r"\bgit\s+(push|reset|clean|checkout\s+\.|filter-branch)"),
+    re.compile(r"\bgit\s+(branch\s+-D|update-ref\s+-d)"),
     re.compile(r"\bsudo\b"),
     re.compile(r"\bmkfs\b"),
     re.compile(r"\bdd\s"),
     re.compile(r">\s*/dev/"),
+    re.compile(r"(?:>\s*|>>\s*)/etc/(?:passwd|shadow|sudoers|hosts|crontab|sysctl\.d/)"),
+    re.compile(r"\b(?:cp\s+/dev/null|mv)\s+/(?:etc|usr/bin|bin|sbin|var/www)\b"),
+    re.compile(r"\bln\s+-s?f?\s+/(?:etc/(?:shadow|passwd)|root|home/[^ ]+/.ssh)\b"),
+    re.compile(r"\b(?:shred|truncate)\b"),
+    re.compile(r"\bfind\b[\s\S]*(?:-delete|-exec\s+(?:shred|cat)\b)"),
+    re.compile(r"\bchmod\b[\s\S]*(?:/etc|/bin|/sbin|/usr/bin|/usr/sbin|/proc|/root)\b"),
+    re.compile(r"\bchown\b[\s\S]*(?:root|:root)[\s\S]*(?:/home|/etc|/bin|/sbin|/usr/bin|/usr/sbin|/root)\b"),
+    re.compile(r"\b(?:curl|wget)\b[\s\S]*\|\s*(?:ba)?sh\b"),
+    re.compile(r"\b(?:curl|wget)\b[\s\S]*(?:-O|--output-document|-o)\s*/tmp/[\w./-]+[\s\S]*chmod\s+\+x\s+/tmp/"),
+    re.compile(r"\b(?:sh|bash|zsh)\s+-c\s+[\"']?\$?\([\s\S]*\b(?:curl|wget)\b"),
+    re.compile(r"\beval\s+\$\([\s\S]*\b(?:curl|wget|base64)\b"),
+    re.compile(r"\b(?:sh|bash|zsh)\s+-c[\s\S]*base64\s+-d\b"),
+    re.compile(r"\b(?:python3?|perl|ruby|node)\b\s+(?:-[ce]|--eval)\b[\s\S]*(?:os\.(?:remove|unlink|rmdir|chmod|system|execv)|shutil\.rmtree|subprocess|curl|wget|id_rsa|/etc/(?:shadow|passwd|sudoers)|\.ssh)"),
+    re.compile(r"(?:/etc/(?:shadow|passwd|sudoers|secret)|/etc/ssl/private|/home/[^ ]+/.ssh|~/.ssh|id_rsa|\.env|nginx\.key)[\s\S]*(?:curl|wget|nc|/dev/tcp)"),
+    re.compile(r"\b(?:curl|wget|nc)\b[\s\S]*(?:/etc/(?:shadow|passwd|sudoers|secret)|/etc/ssl/private|/home/[^ ]+/.ssh|~/.ssh|id_rsa|\.env|nginx\.key)"),
+    re.compile(r"\$[A-Z_]*(?:PASSWORD|TOKEN|SECRET|KEY)[A-Z_]*[\s\S]*\|\s*(?:base64\s*\|\s*)?nc\b"),
+    re.compile(r"\bprintf\b[\s\S]*\\nrm\s"),
+    re.compile(r"\b(?:systemctl|service|launchctl)\s+(?:stop|disable|unload|bootout)\b"),
+    re.compile(r"\bkillall\b"),
+    re.compile(r"\bdocker\s+run\b[\s\S]*-v\s*/:"),
+    re.compile(r"\bnsenter\b"),
+    re.compile(r"export\s+PATH=/tmp:\$PATH"),
+    re.compile(r"HISTFILE=/dev/null"),
     re.compile(r"\bkill\b"),
     re.compile(r"\bpkill\b"),
     re.compile(r"\breboot\b"),

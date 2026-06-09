@@ -119,7 +119,24 @@ def _supports_prompt_cache_params(api_base: str | None) -> bool:
     return "api.openai.com" in api_base
 
 
+def _env_enabled(name: str) -> bool:
+    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str) -> int | None:
+    value = os.environ.get(name)
+    if not value:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    return parsed if parsed > 0 else None
+
+
 def _build_prompt_cache_extra_body(api_base: str | None, model: str) -> dict | None:
+    if _env_enabled("CCA_DISABLE_PROMPT_CACHE"):
+        return None
     if not _supports_prompt_cache_params(api_base):
         return None
     workspace_hash = hashlib.sha256(str(Path.cwd()).encode("utf-8")).hexdigest()[:16]
@@ -197,7 +214,7 @@ class Agent:
         self.max_cost_usd = max_cost_usd
         self.max_turns = max_turns
         self.confirm_fn = confirm_fn
-        self.effective_window = _get_context_window(model) - 20000
+        self.effective_window = _env_int("CCA_EFFECTIVE_CONTEXT_WINDOW") or (_get_context_window(model) - 20000)
         self.session_id = uuid.uuid4().hex[:8]
         self.session_start_time = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -209,6 +226,9 @@ class Agent:
         self.current_turns = 0
         self.last_api_call_time = 0.0
         self._prompt_cache_extra_body = _build_prompt_cache_extra_body(api_base, model)
+        self._tool_concurrency_enabled = not _env_enabled("CCA_DISABLE_TOOL_CONCURRENCY")
+        self._context_compression_enabled = not _env_enabled("CCA_DISABLE_CONTEXT_COMPRESSION")
+        self._usage_json_path = os.environ.get("CCA_USAGE_JSON")
 
         # Abort support
         self._aborted = False
@@ -482,30 +502,57 @@ class Agent:
         except Exception:
             pass
 
+    def _write_usage_snapshot(self) -> None:
+        if not self._usage_json_path:
+            return
+        try:
+            path = Path(self._usage_json_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({
+                "prompt_tokens": self.total_input_tokens,
+                "completion_tokens": self.total_output_tokens,
+                "cached_prompt_tokens": self.total_cached_input_tokens,
+                "last_input_tokens": self.last_input_token_count,
+                "last_cached_prompt_tokens": self.last_cached_input_token_count,
+                "turns": self.current_turns,
+            }), encoding="utf-8")
+        except Exception:
+            pass
+
     # ─── Autocompact ──────────────────────────────────────────
 
-    async def _check_and_compact(self) -> None:
-        if self.last_input_token_count > self.effective_window * 0.85:
-            print_info("Context window filling up, compacting conversation...")
-            await self._compact_conversation()
-
-    async def _compact_conversation(self) -> None:
-        await self._compact_openai()
-        print_info("Conversation compacted.")
-
-    async def _compact_openai(self) -> None:
-        # Invariant: caller must ensure the last message is a plain user-text
-        # message (not a `tool` role result). Slicing off a tool result would
-        # orphan the preceding assistant's tool_calls.
+    async def _check_and_compact(self, *, preserve_last_user: bool = True) -> None:
+        if not self._context_compression_enabled:
+            return
         if len(self._openai_messages) < 5:
             return
+        if self.last_input_token_count > self.effective_window * 0.85:
+            print_info("Context window filling up, compacting conversation...")
+            await self._compact_conversation(preserve_last_user=preserve_last_user)
+
+    async def _compact_conversation(self, *, preserve_last_user: bool = True) -> bool:
+        compacted = await self._compact_openai(preserve_last_user=preserve_last_user)
+        if compacted:
+            print_info("Conversation compacted.")
+        return compacted
+
+    async def _compact_openai(self, *, preserve_last_user: bool = True) -> bool:
+        # User-submission compaction preserves the just-submitted prompt outside
+        # the summary. In-loop compaction summarizes the full committed history;
+        # the caller appends the freshly received assistant response afterwards.
+        if len(self._openai_messages) < 5:
+            return False
         system_msg = self._openai_messages[0]
-        last_user_msg = self._openai_messages[-1]
+        last_user_msg = None
+        messages_to_summarize = self._openai_messages[1:]
+        if preserve_last_user and self._openai_messages[-1].get("role") == "user":
+            last_user_msg = self._openai_messages[-1]
+            messages_to_summarize = self._openai_messages[1:-1]
         summary_resp = await self._openai_client.chat.completions.create(
             model=self.model,
             messages=[
                 {"role": "system", "content": "You are a conversation summarizer. Be concise but preserve important details."},
-                *self._openai_messages[1:-1],
+                *messages_to_summarize,
                 {"role": "user", "content": "Summarize the conversation so far in a concise paragraph, preserving key decisions, file paths, and context needed to continue the work."},
             ],
         )
@@ -513,16 +560,21 @@ class Agent:
         self._openai_messages = [
             system_msg,
             {"role": "user", "content": f"[Previous conversation summary]\n{summary_text}"},
-            {"role": "assistant", "content": "Understood. I have the context from our previous conversation. How can I continue helping?"},
         ]
-        if last_user_msg.get("role") == "user":
-            self._openai_messages.append(last_user_msg)
+        if last_user_msg is not None:
+            self._openai_messages.extend([
+                {"role": "assistant", "content": "Understood. I have the context from our previous conversation. How can I continue helping?"},
+                last_user_msg,
+            ])
         self.last_input_token_count = 0
         self.last_cached_input_token_count = 0
+        return True
 
     # ─── Multi-tier compression pipeline ──────────────────────
 
     def _run_compression_pipeline(self) -> None:
+        if not self._context_compression_enabled:
+            return
         self._budget_tool_results_openai()
         self._snip_stale_results_openai()
         self._microcompact_openai()
@@ -571,6 +623,8 @@ class Agent:
     # read_file to retrieve the full output later — no information is lost.
 
     def _persist_large_result(self, tool_name: str, result: str) -> str:
+        if not self._context_compression_enabled:
+            return result
         THRESHOLD = 30 * 1024  # 30 KB
         if len(result.encode()) <= THRESHOLD:
             return result
@@ -1381,6 +1435,8 @@ specific reason."""
                 self.total_cached_input_tokens += response["usage"].get("cached_prompt_tokens", 0)
                 self.last_input_token_count = response["usage"]["prompt_tokens"]
                 self.last_cached_input_token_count = response["usage"].get("cached_prompt_tokens", 0)
+                self._write_usage_snapshot()
+                await self._check_and_compact(preserve_last_user=False)
 
             choice = response.get("choices", [{}])[0] if response.get("choices") else {}
             message = choice.get("message", {})
@@ -1390,6 +1446,7 @@ specific reason."""
             tool_calls = message.get("tool_calls")
             if not tool_calls:
                 self._sync_task_usage()
+                self._write_usage_snapshot()
                 if not self.is_sub_agent:
                     print_cost(self.total_input_tokens, self.total_output_tokens, self.total_cached_input_tokens)
                 break
@@ -1398,6 +1455,10 @@ specific reason."""
             budget = self._check_budget()
             if budget["exceeded"]:
                 print_info(f"Budget exceeded: {budget['reason']}")
+                self._sync_task_usage()
+                self._write_usage_snapshot()
+                if not self.is_sub_agent:
+                    print_cost(self.total_input_tokens, self.total_output_tokens, self.total_cached_input_tokens)
                 break
 
             # 有toolcall且不超过限额，继续loop
@@ -1453,7 +1514,7 @@ specific reason."""
             # Phase 2: 分组，执行tool call（并行执行连续安全工具）
             oai_batches: list[dict] = []
             for ct in oai_checked:
-                safe = ct["allowed"] and ct["fn"] in CONCURRENCY_SAFE_TOOLS # 判断是否可执行，且并发安全
+                safe = self._tool_concurrency_enabled and ct["allowed"] and ct["fn"] in CONCURRENCY_SAFE_TOOLS # 判断是否可执行，且并发安全
                 if safe and oai_batches and oai_batches[-1]["concurrent"]: # 可并发执行的工具合并到一个batch里
                     oai_batches[-1]["items"].append(ct)
                 else: # 串行执行
