@@ -1,10 +1,6 @@
 # ForgeCC
 
-ForgeCC 是一个从零实现的 Python coding agent CLI，支持 OpenAI-compatible chat backend、工具调用、权限控制、上下文压缩、会话持久化、记忆、Skills、MCP 集成和多 Agent 编排。
-
-> English summary: ForgeCC is a from-scratch Python coding agent runtime that exposes the core architecture of a Claude Code-style CLI agent in a compact, readable codebase.
-
-这个项目的目标不是把所有能力包装成黑盒，而是把 coding agent 的关键运行机制摊开：模型消息循环如何推进、工具如何被注册和调用、写文件和执行 shell 前如何确认权限、长上下文如何裁剪和压缩、会话和记忆如何持久化，以及多个 agent 如何围绕任务板和 worktree 协作。
+ForgeCC 是一个从零实现的 Python coding agent CLI，支持 OpenAI-compatible chat backend、工具调用、权限控制、上下文压缩、会话持久化、记忆、Skills、MCP 集成和多 Agent 编排。把 coding agent 的关键运行机制摊开：模型消息循环如何推进、工具如何被注册和调用、写文件和执行 shell 前如何确认权限、长上下文如何裁剪和压缩、会话和记忆如何持久化，以及多个 agent 如何围绕任务板和 worktree 协作。
 
 ## 项目亮点
 
